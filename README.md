@@ -212,7 +212,7 @@ machine, so the comparison holds; across runs only the ratios do.
   bytecode in between is 1.11x slower than the same work without a hand-off. A thread pays it once when
   it is woken, however much work it then does -- so with one command in flight the whole cost falls on
   that one command.
-- **Sixteen clients spread over the shards, and there Sedis is ahead of Memurai**: 74.3k against its
+- **Sixteen clients spread over the shards, and there Sedis is ahead of Memurai (except for MSET)**: 74.3k against its
   65.9k, which is 1.13x. That is also 2.5x Python's `asyncio` and 2.1x its threads under the GIL.
   Free-threaded Python, whose threads share one dict, is 1.19x Sedis. This is the load sharding was
   built for, and the only one on which Sedis leads a C++ server.

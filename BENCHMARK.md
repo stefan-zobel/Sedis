@@ -100,7 +100,7 @@ Sixteen clients, each still waiting for every answer. Now requests can be served
 
 - **Sedis serves 2.5 times as many requests as Python's `asyncio`** and 2.1 times as many as its threads with the
   GIL. The shards work in parallel; a Python server under the GIL does not.
-- **Sedis is ahead of Memurai here, 1.13 times.** Memurai is single-threaded, as Redis is: one core answers
+- **Sedis is ahead of Memurai here (except for MSET), 1.13 times.** Memurai is single-threaded, as Redis is: one core answers
   everything. This is the load on which sharding pays, and the only one on which Sedis leads a C++ server.
 - **Free-threaded Python is 1.19 times Sedis.** Its sixteen threads share one dictionary and each answers where it
   read, with no crossing at all. What it pays for that is safety: threads that change the same object at the same
