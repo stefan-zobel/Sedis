@@ -1,0 +1,82 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 780 388" width="780" height="388" role="img" aria-label="The path of one command. from a socket read to the answer, in one round">
+<title>The path of one command. from a socket read to the answer, in one round</title>
+<style>
+svg{--surface:#ffffff;--ink:#17202c;--muted:#586476;--faint:#8b95a5;--rule:#dbe0e7;--grid:#e7ebf0;--skarn:#0b7d74;--skarn1:#5fb3aa;--asyncio:#3572a5;--threads:#8a94a6;--ftthreads:#b3306b;--memurai:#7a4fa3;--gc:#c0392b}
+@media (prefers-color-scheme: dark){svg{--surface:#161b22;--ink:#e6ebf1;--muted:#a2adbd;--faint:#74808f;--rule:#2b3440;--grid:#232b36;--skarn:#3cc2b4;--skarn1:#8adfd5;--asyncio:#6aa6dc;--threads:#9aa4b5;--ftthreads:#ec79a8;--memurai:#b38ae0;--gc:#f07c6c}}
+.bg{fill:var(--surface);stroke:var(--rule)}
+text{font-family:ui-monospace, SFMono-Regular, 'Cascadia Mono', Consolas, Menlo, monospace;font-size:12px;fill:var(--muted)}
+.t{font-family:-apple-system, 'Segoe UI', 'Helvetica Neue', Helvetica, Arial, sans-serif;font-size:16px;font-weight:600;fill:var(--ink)}
+.st{font-family:-apple-system, 'Segoe UI', 'Helvetica Neue', Helvetica, Arial, sans-serif;font-size:12.5px;fill:var(--muted)}
+.ax{font-family:-apple-system, 'Segoe UI', 'Helvetica Neue', Helvetica, Arial, sans-serif;font-size:12px;fill:var(--faint)}
+.lab{font-family:-apple-system, 'Segoe UI', 'Helvetica Neue', Helvetica, Arial, sans-serif;font-size:13px;fill:var(--ink)}
+.box{font-family:-apple-system, 'Segoe UI', 'Helvetica Neue', Helvetica, Arial, sans-serif;font-size:13px;fill:var(--ink)}
+.small{font-family:-apple-system, 'Segoe UI', 'Helvetica Neue', Helvetica, Arial, sans-serif;font-size:11.5px;fill:var(--muted)}
+.val{fill:var(--ink);font-weight:600}
+.g{stroke:var(--grid);stroke-width:1}
+.b{stroke:var(--rule);stroke-width:1}
+.frame{fill:none;stroke:var(--faint);stroke-width:1.2}
+.arrow{stroke:var(--muted);stroke-width:1.4;fill:none;marker-end:url(#ah)}
+.whisk{stroke:var(--ink);stroke-width:1;opacity:.55}
+.pale{fill-opacity:.35}
+.f-skarn{fill:var(--skarn)} .s-skarn{stroke:var(--skarn);fill:none}
+.f-skarn1{fill:var(--skarn1)} .s-skarn1{stroke:var(--skarn1);fill:none}
+.f-asyncio{fill:var(--asyncio)} .s-asyncio{stroke:var(--asyncio);fill:none}
+.f-threads{fill:var(--threads)} .s-threads{stroke:var(--threads);fill:none}
+.f-ftthreads{fill:var(--ftthreads)} .s-ftthreads{stroke:var(--ftthreads);fill:none}
+.f-memurai{fill:var(--memurai)} .s-memurai{stroke:var(--memurai);fill:none}
+.f-gc{fill:var(--gc)} .s-gc{stroke:var(--gc);fill:none}
+</style>
+<rect class="bg" x="0.5" y="0.5" width="779" height="387" rx="10"/>
+<text class="t" x="24" y="34">The path of one command</text>
+<text class="st" x="24" y="55">from a socket read to the answer, in one round</text>
+<defs><marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+<rect x="24" y="96" width="132" height="56" rx="8" class="f-threads" fill-opacity=".14"/>
+<rect x="24" y="96" width="132" height="56" rx="8" class="frame"/>
+<text x="90" y="116" text-anchor="middle" class="box">socket read</text>
+<text x="90" y="134" text-anchor="middle" class="small">one wake-up</text>
+<rect x="188" y="96" width="156" height="56" rx="8" class="f-skarn" fill-opacity=".14"/>
+<rect x="188" y="96" width="156" height="56" rx="8" class="frame"/>
+<text x="266" y="116" text-anchor="middle" class="box">RespReader</text>
+<text x="266" y="134" text-anchor="middle" class="small">frames, keeps a tail</text>
+<rect x="376" y="96" width="162" height="56" rx="8" class="f-skarn" fill-opacity=".14"/>
+<rect x="376" y="96" width="162" height="56" rx="8" class="frame"/>
+<text x="457" y="116" text-anchor="middle" class="box">split by key</text>
+<text x="457" y="134" text-anchor="middle" class="small">FNV-1a mod N</text>
+<rect x="576" y="72" width="180" height="46" rx="8" class="f-skarn" fill-opacity=".14"/>
+<rect x="576" y="72" width="180" height="46" rx="8" class="frame"/>
+<text x="666" y="100" text-anchor="middle" class="box">shard 0</text>
+<rect x="576" y="128" width="180" height="46" rx="8" class="f-skarn" fill-opacity=".14"/>
+<rect x="576" y="128" width="180" height="46" rx="8" class="frame"/>
+<text x="666" y="156" text-anchor="middle" class="box">shard 1</text>
+<rect x="576" y="184" width="180" height="46" rx="8" class="f-skarn" fill-opacity=".14"/>
+<rect x="576" y="184" width="180" height="46" rx="8" class="frame"/>
+<text x="666" y="212" text-anchor="middle" class="box">shard 2</text>
+<rect x="376" y="212" width="162" height="56" rx="8" class="f-skarn" fill-opacity=".14"/>
+<rect x="376" y="212" width="162" height="56" rx="8" class="frame"/>
+<text x="457" y="232" text-anchor="middle" class="box">pending</text>
+<text x="457" y="250" text-anchor="middle" class="small">by sequence number</text>
+<rect x="188" y="212" width="156" height="56" rx="8" class="f-skarn" fill-opacity=".14"/>
+<rect x="188" y="212" width="156" height="56" rx="8" class="frame"/>
+<text x="266" y="232" text-anchor="middle" class="box">one write</text>
+<text x="266" y="250" text-anchor="middle" class="small">the whole round at once</text>
+<rect x="24" y="212" width="132" height="56" rx="8" class="f-threads" fill-opacity=".14"/>
+<rect x="24" y="212" width="132" height="56" rx="8" class="frame"/>
+<text x="90" y="232" text-anchor="middle" class="box">socket write</text>
+<text x="90" y="250" text-anchor="middle" class="small">one flush</text>
+<path d="M156,124 L188,124" class="arrow"/>
+<path d="M344,124 L376,124" class="arrow"/>
+<path d="M538,118 L576,95" class="arrow"/>
+<path d="M538,122 L576,151" class="arrow"/>
+<path d="M538,126 L576,207" class="arrow"/>
+<path d="M576,207 L538,232" class="arrow"/>
+<path d="M576,151 L538,236" class="arrow"/>
+<path d="M576,95 L538,240" class="arrow"/>
+<path d="M376,240 L344,240" class="arrow"/>
+<path d="M188,240 L156,240" class="arrow"/>
+<text x="546" y="168" class="small">one Batch per shard, not per command</text>
+<text x="24" y="300" class="small">One socket read can carry many commands — a pipelining client sends sixteen. They are split by shard, and each shard</text>
+<text x="24" y="317" class="small">gets ONE message whatever the count.</text>
+<text x="24" y="334" class="small">Every command keeps its sequence number, so answers that come back out of order are put back in order before anything</text>
+<text x="24" y="351" class="small">is written.</text>
+<text x="24" y="368" class="small">The write happens once per round, not once per answer: what costs is the wake-up, and this pays for it once.</text>
+</svg>

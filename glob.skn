@@ -1,0 +1,109 @@
+// Redis' glob patterns, for KEYS: `*` any run of bytes, `?` any one byte,
+// `[abc]` one of a set, `[^abc]` one not in it, `[a-z]` a range, and `\x` the
+// byte x itself.
+
+// Whether `text` matches `pattern`. The classic two-pointer match: on a
+// mismatch after a `*`, the `*` takes one byte more and the rest is tried
+// again, so no pattern takes more than len(pattern) * len(text) steps.
+pub fn globMatch(pattern: String, text: String) -> Bool {
+    let p = toBytes(pattern)
+    let t = toBytes(text)
+    let mut pi = 0
+    let mut ti = 0
+    let mut starP = -1
+    let mut starT = 0
+    while ti < len(t) {
+        if pi < len(p) && p[pi] == 42 {
+            starP = pi
+            starT = ti
+            pi += 1
+        } else if pi < len(p) && one(p, pi, t[ti]) {
+            pi = next(p, pi)
+            ti += 1
+        } else if starP >= 0 {
+            starT += 1
+            ti = starT
+            pi = starP + 1
+        } else {
+            return false
+        }
+    }
+    while pi < len(p) && p[pi] == 42 {
+        pi += 1
+    }
+    pi == len(p)
+}
+
+// Whether the single pattern element at p[i] (not a `*`) matches the byte c.
+fn one(p: Bytes, i: Int, c: Int) -> Bool {
+    let x = p[i]
+    if x == 63 {
+        return true
+    }
+    if x == 92 && i + 1 < len(p) {
+        return p[i + 1] == c
+    }
+    if x != 91 {
+        return x == c
+    }
+    // a class [...]
+    let mut j = i + 1
+    let negate = j < len(p) && p[j] == 94
+    if negate {
+        j += 1
+    }
+    let mut hit = false
+    while j < len(p) && p[j] != 93 {
+        if p[j] == 92 && j + 1 < len(p) {
+            if p[j + 1] == c {
+                hit = true
+            }
+            j += 2
+        } else if j + 2 < len(p) && p[j + 1] == 45 && p[j + 2] != 93 {
+            let lo = if p[j] <= p[j + 2] { p[j] } else { p[j + 2] }
+            let hi = if p[j] <= p[j + 2] { p[j + 2] } else { p[j] }
+            if c >= lo && c <= hi {
+                hit = true
+            }
+            j += 3
+        } else {
+            if p[j] == c {
+                hit = true
+            }
+            j += 1
+        }
+    }
+    if negate {
+        !hit
+    } else {
+        hit
+    }
+}
+
+// The index after the pattern element at p[i] (not a `*`).
+fn next(p: Bytes, i: Int) -> Int {
+    let x = p[i]
+    if x == 92 && i + 1 < len(p) {
+        return i + 2
+    }
+    if x != 91 {
+        return i + 1
+    }
+    let mut j = i + 1
+    if j < len(p) && p[j] == 94 {
+        j += 1
+    }
+    while j < len(p) && p[j] != 93 {
+        if p[j] == 92 && j + 1 < len(p) {
+            j += 2
+        } else {
+            j += 1
+        }
+    }
+    // An unclosed class runs to the end of the pattern, as in Redis.
+    if j < len(p) {
+        j + 1
+    } else {
+        j
+    }
+}

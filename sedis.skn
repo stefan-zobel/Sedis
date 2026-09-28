@@ -1,0 +1,161 @@
+// Sedis: a key-value server in Skarn that speaks RESP, the protocol of Redis,
+// so Redis' own tools -- redis-cli, redis-benchmark, the client libraries --
+// can talk to it.
+//
+// Run:   skarnvm sedis.skn [--port=P] [--port-file=F] [--shards=N]
+//        skarnvm sedis.skn --selftest
+//   --port=P       the port to listen on (default 6379; 0 lets the OS pick
+//                  a free one)
+//   --port-file=F  write the port to file F once listening (for a harness)
+//   --shards=N     how many shard actors hold the keys (default 4)
+//   --dir=D        keep the data in directory D: one append-only file per
+//                  shard, replayed at the start (default: in memory only)
+//   --appendfsync=P  when the log reaches the disk: always (before an answer),
+//                  everysec (the default) or no (when the system decides)
+//   --rewrite-min=B  rewrite a shard's log once it has doubled since the last
+//                  rewrite and holds B bytes or more (default 64 MiB)
+//   --logfile=F    also write the server's messages to file F, with a time
+//                  stamp and a level on each line
+//   --enable-debug  allow DEBUG CRASH key, which crashes the shard holding
+//                  the key (its supervisor starts it again)
+//   --selftest     start a server on a free port (with --dir: on data in
+//                  D), run a scripted conversation against it in this
+//                  process, and exit 0 if every answer was the expected one
+//
+// The server runs until the process is ended (Ctrl+C). README.md lists the
+// commands.
+
+import aof
+import selftest
+import server
+import shard
+use aof::*
+use server::*
+use shard::*
+use std::actor::*
+use std::cli::*
+use std::env::*
+use std::io::*
+use std::log::*
+use std::process::exit
+
+
+fn number(opts: CliArgs, name: String, dflt: String) -> Result[Int, String] {
+    match parseInt(opts.getOptOr(name, dflt)) {
+        Ok(n) => Ok(n),
+        Err(_) => Err("--${name} needs a whole number")
+    }
+}
+
+// The options that decide where the data is kept. With --dir, the directory
+// holds one log per shard and a file that records how many shards wrote them:
+// a key's shard depends on that number, so the data cannot be read back with
+// a different one.
+fn persistence(opts: CliArgs, shards: Int) -> Result[Persistence, String] {
+    let rewriteMin = number(opts, "rewrite-min", "67108864")?
+    let fsync = match opts.getOptOr("appendfsync", "everysec") {
+        "always" => Fsync::Always,
+        "everysec" => Fsync::EverySec,
+        "no" => Fsync::No,
+        other => {
+            return Err(
+                "--appendfsync must be always, everysec or no, not " + other
+            )
+        }
+    }
+    let dir = match opts.getOpt("dir") {
+        Some(d) => d,
+        None => return Ok(Persistence { dir: "", fsync: fsync, rewriteMin: 0 })
+    }
+    if !isDir(dir) {
+        mkdir(dir)?
+    }
+    let meta = dir + "/sedis.meta"
+    let line = "shards=" + toString(shards)
+    if fileExists(meta) {
+        let written = trim(readTextFile(meta)?)
+        if written != line {
+            return Err(
+                dir
+                    + " holds data written with "
+                    + written
+                    + "; start with --"
+                    + written
+            )
+        }
+    } else {
+        writeTextFile(meta, line + "\n")?
+    }
+    Ok(Persistence { dir: dir, fsync: fsync, rewriteMin: rewriteMin })
+}
+
+fn run() -> Result[(), String] {
+    let opts = CliArgs::parse(args())
+    let shards = number(opts, "shards", "4")?
+    if shards < 1 {
+        return Err("--shards must be 1 or more")
+    }
+    let persist = persistence(opts, shards)?
+    if opts.hasFlag("selftest") {
+        return selftest::run(persist)
+    }
+    let port = number(opts, "port", "6379")?
+    let out = match opts.getOpt("logfile") {
+        Some(f) => Say { file: Some(Log::toFile(f, Level::Info)) },
+        None => Say { file: None }
+    }
+    let inbox: Inbox[Int] = mainInbox()
+    let server = startServer(
+        port,
+        shards,
+        persist,
+        out,
+        opts.hasFlag("enable-debug")
+    )?
+    say(out, "sedis listening on port ${server.port} with ${shards} shards")
+    // The port file comes last: whoever waits for it may rely on the rest.
+    match opts.getOpt("port-file") {
+        Some(f) => { writeFile(f, toBytes(toString(server.port)))? },
+        None => {}
+    }
+    // From here on: a shard started again after a crash reports on
+    // `restarts`; the supervisor that gave up, on the main inbox.
+    let watching = toVec([inbox.ref(), server.restarts.ref()])
+    loop {
+        match select(watching, -1) {
+            Some(0) => {
+                match inbox.receive() {
+                    Mail::Exited(_, why) => {
+                        sayError(out, "the shards' supervisor gave up: ${why}")
+                        return Err(why)
+                    },
+                    _ => {}
+                }
+            },
+            _ => {
+                match server.restarts.receive() {
+                    Mail::Msg(Ok(up)) => {
+                        let what = if up.note == "" {
+                            ""
+                        } else {
+                            " -- " + up.note
+                        }
+                        say(out, "shard ${up.index} restarted${what}")
+                    },
+                    Mail::Msg(Err(e)) => {
+                        sayError(out, "a shard could not restart: ${e}")
+                    },
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+match run() {
+    Ok(_) => {},
+    Err(e) => {
+        eprintln("sedis: ${e}")
+        exit(1)
+    }
+}

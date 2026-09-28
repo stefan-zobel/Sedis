@@ -1,0 +1,511 @@
+// The self-test: a Sedis server on a free port and a scripted conversation with
+// it, in one process.
+//
+// Every step is a command and the answer it must get, shown as redis-cli shows
+// it. The clients are std::resp's RespClient, blocking, so the transcript is
+// the same on every run. A different answer ends the test with an error naming
+// the step.
+
+import aof
+import server
+import shard
+use aof::*
+use server::*
+use shard::*
+use std::resp::*
+use std::time::*
+
+
+struct Step {
+    words: Vec[String],
+    want: String
+}
+
+fn step(words: Vec[String], want: String) -> Step {
+    Step { words: words, want: want }
+}
+
+// The text of an error answer.
+fn errorText(r: Resp) -> String {
+    match r {
+        Resp::Error(e) => e,
+        _ => ""
+    }
+}
+
+fn show(words: Vec[String]) -> String {
+    let mut s = ""
+    for w in words {
+        s = if len(s) == 0 { w } else { s + " " + w }
+    }
+    s
+}
+
+// Run the steps one at a time on `c`, printing each command and its answer.
+fn play(mut c: RespClient, who: String, ss: Vec[Step]) -> Result[Int, String] {
+    for st in ss {
+        let got = c.call(st.words)?.render()
+        println("${who} > ${show(st.words)}")
+        println("${who} < ${got}")
+        if got != st.want {
+            let cmd = show(st.words)
+            return Err("after '${cmd}' expected '${st.want}', got '${got}'")
+        }
+    }
+    Ok(len(ss))
+}
+
+fn strings() -> Vec[Step] {
+    toVec(
+        [
+            step(toVec(["PING"]), "PONG"),
+            step(toVec(["ping", "hello"]), "\"hello\""),
+            step(toVec(["ECHO", "a b"]), "\"a b\""),
+            step(toVec(["GET", "greeting"]), "(nil)"),
+            step(toVec(["SET", "greeting", "hello world"]), "OK"),
+            step(toVec(["GET", "greeting"]), "\"hello world\""),
+            step(toVec(["STRLEN", "greeting"]), "(integer) 11"),
+            step(toVec(["APPEND", "greeting", "!"]), "(integer) 12"),
+            step(toVec(["GET", "greeting"]), "\"hello world!\""),
+            step(toVec(["APPEND", "fresh", "abc"]), "(integer) 3"),
+            step(toVec(["STRLEN", "nothing"]), "(integer) 0"),
+            step(toVec(["INCR", "counter"]), "(integer) 1"),
+            step(toVec(["INCRBY", "counter", "41"]), "(integer) 42"),
+            step(toVec(["DECR", "counter"]), "(integer) 41"),
+            step(toVec(["DECRBY", "counter", "-9"]), "(integer) 50"),
+            step(
+                toVec(["INCR", "greeting"]),
+                "(error) ERR value is not an integer or out of range"
+            ),
+            step(
+                toVec(["INCRBY", "counter", "1.5"]),
+                "(error) ERR value is not an integer or out of range"
+            ),
+            step(
+                toVec(["INCRBY", "counter", "+1"]),
+                "(error) ERR value is not an integer or out of range"
+            ),
+            step(toVec(["SET", "big", "140737488355326"]), "OK"),
+            step(toVec(["INCR", "big"]), "(integer) 140737488355327"),
+            step(
+                toVec(["INCR", "big"]),
+                "(error) ERR increment or decrement would overflow"
+            ),
+            step(toVec(["GET", "big"]), "\"140737488355327\"")
+        ]
+    )
+}
+
+fn expiry() -> Vec[Step] {
+    toVec(
+        [
+            step(toVec(["SET", "t", "v", "EX", "100"]), "OK"),
+            step(toVec(["TTL", "t"]), "(integer) 100"),
+            step(toVec(["PERSIST", "t"]), "(integer) 1"),
+            step(toVec(["TTL", "t"]), "(integer) -1"),
+            step(toVec(["PERSIST", "t"]), "(integer) 0"),
+            step(toVec(["TTL", "nothing"]), "(integer) -2"),
+            step(toVec(["EXPIRE", "t", "100"]), "(integer) 1"),
+            step(toVec(["EXPIRE", "t", "50", "GT"]), "(integer) 0"),
+            step(toVec(["EXPIRE", "t", "200", "GT"]), "(integer) 1"),
+            step(toVec(["TTL", "t"]), "(integer) 200"),
+            step(toVec(["EXPIRE", "t", "10", "NX"]), "(integer) 0"),
+            step(toVec(["EXPIRE", "nothing", "10"]), "(integer) 0"),
+            step(toVec(["SET", "t", "w"]), "OK"),
+            step(toVec(["TTL", "t"]), "(integer) -1"),
+            step(toVec(["SET", "t", "x", "EX", "100"]), "OK"),
+            step(toVec(["SET", "t", "y", "KEEPTTL"]), "OK"),
+            step(toVec(["TTL", "t"]), "(integer) 100"),
+            step(toVec(["EXPIRE", "t", "-1"]), "(integer) 1"),
+            step(toVec(["EXISTS", "t"]), "(integer) 0"),
+            step(toVec(["SET", "n", "a", "NX"]), "OK"),
+            step(toVec(["SET", "n", "b", "NX"]), "(nil)"),
+            step(toVec(["SET", "n", "c", "XX", "GET"]), "\"a\""),
+            step(toVec(["GET", "n"]), "\"c\""),
+            step(toVec(["SET", "none", "z", "XX"]), "(nil)"),
+            step(
+                toVec(["SET", "e", "v", "EX", "0"]),
+                "(error) ERR invalid expire time in 'set' command"
+            ),
+            step(
+                toVec(["SET", "e", "v", "EX", "soon"]),
+                "(error) ERR value is not an integer or out of range"
+            ),
+            step(toVec(["SET", "e", "v", "LATER"]), "(error) ERR syntax error"),
+            step(toVec(["SET", "gone", "v", "PX", "50"]), "OK")
+        ]
+    )
+}
+
+fn hashes() -> Vec[Step] {
+    toVec(
+        [
+            step(toVec(["HSET", "h", "f1", "a", "f2", "b"]), "(integer) 2"),
+            step(toVec(["HSET", "h", "f1", "c"]), "(integer) 0"),
+            step(toVec(["HGET", "h", "f1"]), "\"c\""),
+            step(toVec(["HGET", "h", "nothing"]), "(nil)"),
+            step(toVec(["HLEN", "h"]), "(integer) 2"),
+            step(toVec(["HEXISTS", "h", "f2"]), "(integer) 1"),
+            step(toVec(["HINCRBY", "h", "n", "5"]), "(integer) 5"),
+            step(
+                toVec(["HINCRBY", "h", "f1", "1"]),
+                "(error) ERR hash value is not an integer"
+            ),
+            step(toVec(["HDEL", "h", "f1", "f2", "n", "x"]), "(integer) 3"),
+            step(toVec(["EXISTS", "h"]), "(integer) 0"),
+            step(toVec(["HGETALL", "h"]), "(empty array)"),
+            step(toVec(["HSET", "h2", "only", "x"]), "(integer) 1"),
+            step(toVec(["HGETALL", "h2"]), "1) \"only\"\n2) \"x\""),
+            step(toVec(["HKEYS", "h2"]), "1) \"only\""),
+            step(toVec(["HVALS", "h2"]), "1) \"x\""),
+            step(toVec(["TYPE", "h2"]), "hash"),
+            step(
+                toVec(["GET", "h2"]),
+                "(error) WRONGTYPE Operation against a key holding the wrong "
+                    + "kind of value"
+            ),
+            step(
+                toVec(["LPUSH", "h2", "x"]),
+                "(error) WRONGTYPE Operation against a key holding the wrong "
+                    + "kind of value"
+            ),
+            step(
+                toVec(["HSET", "h2", "odd"]),
+                "(error) ERR wrong number of arguments for 'hset' command"
+            )
+        ]
+    )
+}
+
+fn lists() -> Vec[Step] {
+    toVec(
+        [
+            step(toVec(["RPUSH", "l", "a", "b", "c"]), "(integer) 3"),
+            step(toVec(["LPUSH", "l", "z"]), "(integer) 4"),
+            step(
+                toVec(["LRANGE", "l", "0", "-1"]),
+                "1) \"z\"\n2) \"a\"\n3) \"b\"\n4) \"c\""
+            ),
+            step(toVec(["LRANGE", "l", "-2", "10"]), "1) \"b\"\n2) \"c\""),
+            step(toVec(["LRANGE", "l", "3", "1"]), "(empty array)"),
+            step(toVec(["LINDEX", "l", "-1"]), "\"c\""),
+            step(toVec(["LINDEX", "l", "9"]), "(nil)"),
+            step(toVec(["TYPE", "l"]), "list"),
+            step(toVec(["LPOP", "l"]), "\"z\""),
+            step(toVec(["RPOP", "l", "2"]), "1) \"c\"\n2) \"b\""),
+            step(toVec(["LLEN", "l"]), "(integer) 1"),
+            step(toVec(["LPOP", "l"]), "\"a\""),
+            step(toVec(["EXISTS", "l"]), "(integer) 0"),
+            step(toVec(["LPOP", "l"]), "(nil)"),
+            step(toVec(["LPOP", "l", "2"]), "(nil)"),
+            step(toVec(["TYPE", "l"]), "none"),
+            step(toVec(["LLEN", "l"]), "(integer) 0")
+        ]
+    )
+}
+
+fn stubs(persisted: Bool) -> Vec[Step] {
+    let on = if persisted { "yes" } else { "no" }
+    toVec(
+        [
+            step(toVec(["COMMAND", "DOCS"]), "(empty array)"),
+            step(toVec(["CONFIG", "GET", "save"]), "1) \"save\"\n2) \"\""),
+            step(
+                toVec(["config", "get", "appendonly"]),
+                "1) \"appendonly\"\n2) \"" + on + "\""
+            ),
+            step(toVec(["CONFIG", "GET", "maxmemory"]), "(empty array)"),
+            step(
+                toVec(["CONFIG", "SET", "x", "y"]),
+                "(error) ERR CONFIG SET is not supported"
+            ),
+            step(toVec(["CLIENT", "SETNAME", "me"]), "OK"),
+            step(toVec(["SELECT", "0"]), "OK"),
+            step(
+                toVec(["SELECT", "1"]),
+                "(error) ERR DB index is out of range"
+            ),
+            step(
+                toVec(["BGREWRITEAOF"]),
+                if persisted { "OK" } else { "(error) " + errorText(noLog()) }
+            )
+        ]
+    )
+}
+
+fn multiKey() -> Vec[Step] {
+    toVec(
+        [
+            step(
+                toVec(
+                    [
+                        "MSET",
+                        "k1",
+                        "v1",
+                        "k2",
+                        "v2",
+                        "k3",
+                        "v3",
+                        "k4",
+                        "v4",
+                        "k5",
+                        "v5"
+                    ]
+                ),
+                "OK"
+            ),
+            step(
+                toVec(["MGET", "k5", "missing", "k1", "k3", "k1"]),
+                "1) \"v5\"\n2) (nil)\n3) \"v1\"\n4) \"v3\"\n5) \"v1\""
+            ),
+            step(toVec(["EXISTS", "k1", "k2", "missing", "k1"]), "(integer) 3"),
+            step(toVec(["DEL", "k1", "k2", "missing"]), "(integer) 2"),
+            step(toVec(["EXISTS", "k1", "k2", "k3"]), "(integer) 1"),
+            step(toVec(["DBSIZE"]), "(integer) 7"),
+            step(
+                toVec(["MSET", "odd"]),
+                "(error) ERR wrong number of arguments for 'mset' command"
+            ),
+            step(
+                toVec(["GET"]),
+                "(error) ERR wrong number of arguments for 'get' command"
+            ),
+            step(
+                toVec(["FROB", "x", "y"]),
+                "(error) ERR unknown command 'FROB', "
+                    + "with args beginning with: 'x' 'y' "
+            ),
+            step(toVec(["FLUSHDB"]), "OK"),
+            step(toVec(["DBSIZE"]), "(integer) 0")
+        ]
+    )
+}
+
+pub fn run(persist: Persistence) -> Result[(), String] {
+    let server = startServer(0, 4, persist, Say { file: None }, true)?
+    let port = server.port
+    let mut steps = 0
+    let mut a = RespClient::connect("127.0.0.1", port)?
+    let mut b = RespClient::connect("127.0.0.1", port)?
+    // A directory given with --dir may hold an earlier run's data.
+    let _f = a.call(toVec(["FLUSHDB"]))?
+    steps += play(a, "a", strings())?
+    // A second client sees what the first one wrote.
+    steps += play(b, "b", toVec([step(toVec(["GET", "counter"]), "\"50\"")]))?
+    steps += play(a, "a", multiKey())?
+
+    // Pipelining: 40 commands in one write, over all shards; the answers come
+    // back in order.
+    let mut cmds: Vec[Vec[String]] = vec()
+    let mut i = 0
+    while i < 20 {
+        push(cmds, toVec(["INCR", "p${i % 5}"]))
+        push(cmds, toVec(["GET", "p${i % 5}"]))
+        i += 1
+    }
+    let answers = b.pipeline(cmds)?
+    let mut j = 0
+    let mut ok = true
+    for r in answers {
+        let round = j / 10 + 1
+        let want = if j % 2 == 0 {
+            "(integer) ${round}"
+        } else {
+            "\"${round}\""
+        }
+        if r.render() != want {
+            ok = false
+        }
+        j += 1
+    }
+    println("b > (a pipeline of 40 commands: INCR and GET of p0..p4, 4 rounds)")
+    println("b < ${len(answers)} answers, in order: ${ok}")
+    if !ok || len(answers) != 40 {
+        return Err("the pipeline's answers were not in order")
+    }
+    steps += 1
+
+    // A value is bytes: line breaks and all.
+    steps += play(
+        b,
+        "b",
+        toVec(
+            [
+                step(toVec(["SET", "raw", "line1\r\nline2"]), "OK"),
+                step(toVec(["STRLEN", "raw"]), "(integer) 12")
+            ]
+        )
+    )?
+
+    steps += play(a, "a", expiry())?
+    // "gone" was set to end after 50 ms.
+    sleep(150)
+    steps += play(a, "a", toVec([step(toVec(["GET", "gone"]), "(nil)")]))?
+    steps += play(b, "b", hashes())?
+    steps += play(b, "b", lists())?
+    steps += play(a, "a", stubs(persist.dir != ""))?
+    steps += checkInfo(a)?
+    steps += checkDeque(b)?
+    steps += checkKeys(a)?
+    steps += checkSweep(a)?
+    steps += checkCrash(a, b, persist.dir != "")?
+
+    // QUIT answers OK, then the server closes the connection.
+    steps += play(a, "a", toVec([step(toVec(["QUIT"]), "OK")]))?
+    match a.call(toVec(["PING"])) {
+        Ok(r) => return Err("a PING after QUIT was answered: ${r.render()}"),
+        Err(_) => {
+            println("a > PING")
+            println("a < (the connection is closed)")
+        }
+    }
+    steps += 1
+    let _b = b.close()
+    println("selftest: ${steps} steps ok")
+    Ok(())
+}
+
+// INFO names the Redis version it answers like.
+fn checkInfo(mut c: RespClient) -> Result[Int, String] {
+    let info = c.call(toVec(["INFO"]))?.render()
+    let named = indexOf(info, "redis_version:") >= 0
+    println("a > INFO")
+    println("a < (a bulk string that names redis_version: ${named})")
+    if !named {
+        return Err("INFO has no redis_version")
+    }
+    Ok(1)
+}
+
+// A list that wraps around its ring buffer and grows: 10 at the front, 10 at
+// the back, in one pipeline.
+fn checkDeque(mut c: RespClient) -> Result[Int, String] {
+    let mut cmds: Vec[Vec[String]] = vec()
+    let mut i = 1
+    while i <= 10 {
+        push(cmds, toVec(["LPUSH", "d", "x${i}"]))
+        push(cmds, toVec(["RPUSH", "d", "y${i}"]))
+        i += 1
+    }
+    push(cmds, toVec(["LRANGE", "d", "0", "-1"]))
+    let answers = c.pipeline(cmds)?
+    let mut want = ""
+    let mut n = 1
+    let mut k = 10
+    while k >= 1 {
+        want = want + "${n}) \"x${k}\"\n"
+        n += 1
+        k -= 1
+    }
+    k = 1
+    while k <= 10 {
+        want = want + "${n}) \"y${k}\"" + (if k < 10 { "\n" } else { "" })
+        n += 1
+        k += 1
+    }
+    let got = answers[20].render()
+    println("b > (LPUSH x1..x10 and RPUSH y1..y10, interleaved, then LRANGE)")
+    println("b < x10..x1 then y1..y10: ${got == want}")
+    if got != want {
+        return Err("the list came back as ${got}")
+    }
+    Ok(1)
+}
+
+// KEYS over all shards; the order across shards is not defined, so the
+// names are sorted here.
+fn checkKeys(mut c: RespClient) -> Result[Int, String] {
+    let _f = c.call(toVec(["FLUSHDB"]))?
+    let _m = c.call(
+        toVec(["MSET", "ka", "1", "kb", "2", "kc", "3", "other", "4"])
+    )?
+    let mut names: Vec[String] = vec()
+    match c.call(toVec(["KEYS", "k[a-b]*"]))? {
+        Resp::Arr(items) => {
+            for it in items {
+                match it {
+                    Resp::Bulk(s) => push(names, s),
+                    _ => {}
+                }
+            }
+        },
+        other => return Err("KEYS answered ${other.render()}")
+    }
+    sort(names)
+    let got = show(names)
+    println("a > KEYS k[a-b]*")
+    println("a < ${got}")
+    if got != "ka kb" {
+        return Err("KEYS found ${got}")
+    }
+    Ok(1)
+}
+
+// The active half of expiry: 30 keys that end after 50 ms are gone without
+// being asked for, and DBSIZE (which counts keys not yet removed) says so.
+fn checkSweep(mut c: RespClient) -> Result[Int, String] {
+    let _f = c.call(toVec(["FLUSHDB"]))?
+    let mut cmds: Vec[Vec[String]] = vec()
+    let mut i = 0
+    while i < 30 {
+        push(cmds, toVec(["SET", "s${i}", "v", "PX", "50"]))
+        i += 1
+    }
+    let _s = c.pipeline(cmds)?
+    let before = c.call(toVec(["DBSIZE"]))?.render()
+    sleep(500)
+    let after = c.call(toVec(["DBSIZE"]))?.render()
+    println("a > (30 keys that end after 50 ms; DBSIZE, a pause, DBSIZE)")
+    println("a < ${before}, then ${after}")
+    if before != "(integer) 30" || after != "(integer) 0" {
+        return Err("the sweep left ${after}")
+    }
+    Ok(1)
+}
+
+// Let it crash: DEBUG CRASH makes the shard that holds "crashme" crash. Its
+// supervisor starts it again at the same address, and the command that killed
+// it is answered with an error once the connection notices. The other shards
+// never stop. With --dir the shard replays its log, and its data is back; in
+// memory only, that shard starts empty.
+fn checkCrash(mut a: RespClient, mut b: RespClient, persisted: Bool) -> Result[
+    Int,
+    String
+] {
+    let doomed = shardOf("crashme", 4)
+    let mut other = ""
+    let mut i = 0
+    while other == "" {
+        if shardOf("o${i}", 4) != doomed {
+            other = "o${i}"
+        }
+        i += 1
+    }
+    let lost = "(error) ERR the shard restarted before it answered; the"
+        + " command may or may not have run"
+    let back = if persisted { "\"before\"" } else { "(nil)" }
+    let mut n = play(
+        a,
+        "a",
+        toVec(
+            [
+                step(toVec(["SET", "crashme", "before"]), "OK"),
+                step(toVec(["SET", other, "safe"]), "OK"),
+                step(toVec(["DEBUG", "CRASH", "crashme"]), lost)
+            ]
+        )
+    )?
+    n += play(b, "b", toVec([step(toVec(["GET", other]), "\"safe\"")]))?
+    n += play(
+        a,
+        "a",
+        toVec(
+            [
+                step(toVec(["GET", "crashme"]), back),
+                step(toVec(["SET", "crashme", "after"]), "OK"),
+                step(toVec(["GET", "crashme"]), "\"after\"")
+            ]
+        )
+    )?
+    Ok(n)
+}

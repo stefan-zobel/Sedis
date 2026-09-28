@@ -1,0 +1,359 @@
+// The append-only file: every change a shard makes, written as the RESP
+// command that makes it, so that replaying the file rebuilds the shard. One
+// file per shard, <dir>/shard-<i>.aof, as Redis writes its own.
+//
+// What is written is the EFFECT, in a form that means the same later: an
+// EXPIRE in 10 seconds becomes a PEXPIREAT at the moment it ends, and a SET
+// with EX becomes a SET with PXAT. Commands that failed, or changed nothing,
+// are not written.
+//
+// When the file reaches the disk is the fsync policy: `always` before a batch
+// is answered, `everysec` once a second, `no` whenever the operating system
+// decides. A rewrite replaces the file by the shortest one that rebuilds the
+// same data: written to a temporary file, synced, then renamed over the old
+// one, so a crash in between leaves one whole file or the other.
+
+import commands
+import deque
+use commands::*
+use deque::*
+use std::io::*
+use std::resp::*
+
+
+// How the log reaches the disk.
+pub enum Fsync {
+    Always,
+    EverySec,
+    No
+}
+
+pub struct Aof {
+    path: String,
+    file: File,
+    fsync: Fsync,
+    dirty: Bool,
+    lastSync: Int,
+    // bytes in the file now, and after the last rewrite (or the start)
+    size: Int,
+    base: Int,
+    rewriteMin: Int
+}
+
+pub fn aofPath(dir: String, index: Int) -> String {
+    dir + "/shard-" + toString(index) + ".aof"
+}
+
+// Open the log of a shard for appending.
+pub fn openAof(path: String, fsync: Fsync, rewriteMin: Int, now: Int) -> Result[
+    Aof,
+    String
+] {
+    let f = openFile(path, FileMode::Append)?
+    let size = fileSize(path)?
+    Ok(
+        Aof {
+            path: path,
+            file: f,
+            fsync: fsync,
+            dirty: false,
+            lastSync: now,
+            size: size,
+            base: size,
+            rewriteMin: rewriteMin
+        }
+    )
+}
+
+// What `replay` found.
+pub struct Replayed {
+    commands: Int,
+    // bytes at the end of the file that are no whole command
+    tail: Int
+}
+
+// Rebuild `ks` from the file at `path`, if there is one. A command cut off at
+// the end (the process died while writing it) is counted in `tail` and
+// otherwise ignored; anything else that is not a valid command is an error,
+// and the shard must not start on half its data.
+pub fn replay(mut ks: Keyspace, path: String, now: Int) -> Result[
+    Replayed,
+    String
+] {
+    if !fileExists(path) {
+        return Ok(Replayed { commands: 0, tail: 0 })
+    }
+    let f = openFile(path, FileMode::Read)?
+    let mut rd = RespReader::new()
+    let mut n = 0
+    let mut going = true
+    while going {
+        let chunk = f.read(65536)?
+        if len(chunk) == 0 {
+            going = false
+        } else {
+            rd.feed(chunk)
+            let mut more = true
+            while more {
+                match rd.nextCommand() {
+                    Ok(Some(args)) => {
+                        let name = toUpper(args[0])
+                        let known = match specOf(name) {
+                            Some(s) => arityOk(name, s, len(args)),
+                            None => false
+                        }
+                        if !known {
+                            let _c = f.close()
+                            return Err(
+                                path
+                                    + ": command "
+                                    + toString(n + 1)
+                                    + " is not a valid command: "
+                                    + args[0]
+                            )
+                        }
+                        let _r = execute(ks, name, args, now)
+                        n += 1
+                    },
+                    Ok(None) => { more = false },
+                    Err(e) => {
+                        let _c = f.close()
+                        return Err(
+                            path + ": after command " + toString(n) + ": " + e
+                        )
+                    }
+                }
+            }
+        }
+    }
+    f.close()?
+    Ok(Replayed { commands: n, tail: rd.buffered() })
+}
+
+// The log entry for a command that has just run, onto `out`: the effect, in a
+// form that replays to the same data. `reply` is what the command answered.
+// True when something was written. It appends to the batch's buffer instead of
+// returning a buffer of its own, because the caller only ever appended it --
+// which cost a Bytes and a full copy per logged command.
+pub fn entryFor(
+    mut out: Bytes,
+    ks: Keyspace,
+    name: String,
+    args: Vec[String],
+    reply: Resp
+) -> Bool {
+    let failed = match reply {
+        Resp::Error(_) => true,
+        _ => false
+    }
+    if failed {
+        return false
+    }
+    let changed = match reply {
+        Resp::Integer(n) => n > 0,
+        Resp::Null => false,
+        Resp::NullArray => false,
+        _ => true
+    }
+    let key = if len(args) > 1 { args[1] } else { "" }
+    match name {
+        // the state it left, as SET k v [PXAT at]: covers NX, XX, GET,
+        // KEEPTTL and a relative time alike
+        "SET" => match get(ks.data, key) {
+            Some(Val::Str(v)) => {
+                appendArrayHeader(out, 3)
+                appendBulk(out, "SET")
+                appendBulk(out, key)
+                appendBulk(out, v)
+                appendExpiry(out, ks, key)
+                true
+            },
+            _ => false
+        },
+        "EXPIRE" => expiryEntry(out, ks, key, changed),
+        "PEXPIRE" => expiryEntry(out, ks, key, changed),
+        "EXPIREAT" => expiryEntry(out, ks, key, changed),
+        "PEXPIREAT" => expiryEntry(out, ks, key, changed),
+        "FLUSHDB" => flushEntry(out),
+        "FLUSHALL" => flushEntry(out),
+        // these changed something only if they answered more than nothing
+        "DEL" => changed && wrote(out, args),
+        "HDEL" => changed && wrote(out, args),
+        "PERSIST" => changed && wrote(out, args),
+        "LPOP" => changed && wrote(out, args),
+        "RPOP" => changed && wrote(out, args),
+        // deterministic, and they did what they say
+        "INCR" => wrote(out, args),
+        "DECR" => wrote(out, args),
+        "INCRBY" => wrote(out, args),
+        "DECRBY" => wrote(out, args),
+        "APPEND" => wrote(out, args),
+        "MSET" => wrote(out, args),
+        "HSET" => wrote(out, args),
+        "HINCRBY" => wrote(out, args),
+        "LPUSH" => wrote(out, args),
+        "RPUSH" => wrote(out, args),
+        // everything else reads
+        _ => false
+    }
+}
+
+// The command as it came, onto `out`; always true, so it reads as one arm.
+fn wrote(mut out: Bytes, args: Vec[String]) -> Bool {
+    appendCommand(out, args)
+    true
+}
+
+fn flushEntry(mut out: Bytes) -> Bool {
+    appendArrayHeader(out, 1)
+    appendBulk(out, "FLUSHDB")
+    true
+}
+
+// PEXPIREAT k at, if the key has an end.
+fn appendExpiry(mut out: Bytes, ks: Keyspace, key: String) -> () {
+    match get(ks.expires, key) {
+        Some(at) => {
+            appendArrayHeader(out, 3)
+            appendBulk(out, "PEXPIREAT")
+            appendBulk(out, key)
+            appendBulk(out, toString(at))
+        },
+        None => {}
+    }
+}
+
+// After an EXPIRE that did something: the key has its new end, or (a time in
+// the past) it is gone.
+fn expiryEntry(mut out: Bytes, ks: Keyspace, key: String, changed: Bool) -> Bool {
+    if !changed {
+        return false
+    }
+    if has(ks.data, key) {
+        let before = len(out)
+        appendExpiry(out, ks, key)
+        len(out) > before
+    } else {
+        appendArrayHeader(out, 2)
+        appendBulk(out, "DEL")
+        appendBulk(out, key)
+        true
+    }
+}
+
+impl Aof {
+    // Append what one batch changed. With `always` it is on the disk when
+    // this returns.
+    fn append(mut self, data: Bytes, now: Int) -> Result[(), String] {
+        if len(data) == 0 {
+            return Ok(())
+        }
+        self.file.write(data)?
+        self.size += len(data)
+        match self.fsync {
+            Fsync::Always => {
+                self.file.sync()?
+                self.lastSync = now
+            },
+            _ => { self.dirty = true }
+        }
+        Ok(())
+    }
+
+    // Called now and then: `everysec` syncs here once a second.
+    fn tick(mut self, now: Int) -> Result[(), String] {
+        let due = match self.fsync {
+            Fsync::EverySec => self.dirty && now - self.lastSync >= 1000,
+            _ => false
+        }
+        if due {
+            self.file.sync()?
+            self.dirty = false
+            self.lastSync = now
+        }
+        Ok(())
+    }
+
+    // Whether the file has grown enough since the last rewrite to rewrite it:
+    // twice its size then, and at least `rewriteMin` bytes.
+    fn wantsRewrite(self) -> Bool {
+        self.size >= self.rewriteMin && self.size >= 2 * self.base
+    }
+
+    // Replace the file by the shortest one that rebuilds `ks`.
+    fn rewrite(mut self, ks: Keyspace) -> Result[(), String] {
+        let tmp = self.path + ".tmp"
+        let out = openFile(tmp, FileMode::Write)?
+        let mut buf = bytes()
+        let mut written = 0
+        for (k, v) in ks.data {
+            match v {
+                Val::Str(s) => {
+                    appendArrayHeader(buf, 3)
+                    appendBulk(buf, "SET")
+                    appendBulk(buf, k)
+                    appendBulk(buf, s)
+                },
+                Val::Hash(h) => { appendHash(buf, k, h) },
+                Val::List(d) => { appendList(buf, k, d) }
+            }
+            appendExpiry(buf, ks, k)
+            if len(buf) >= 65536 {
+                out.write(buf)?
+                written += len(buf)
+                buf = bytes()
+            }
+        }
+        out.write(buf)?
+        written += len(buf)
+        out.sync()?
+        out.close()?
+        // the old file is closed before it is replaced (Windows would refuse
+        // otherwise); its data is all in the new one
+        self.file.close()?
+        rename(tmp, self.path)?
+        self.file = openFile(self.path, FileMode::Append)?
+        self.size = written
+        self.base = written
+        self.dirty = false
+        Ok(())
+    }
+
+    fn close(self) -> () {
+        let _s = self.file.sync()
+        let _c = self.file.close()
+    }
+}
+
+// HSET k f v f v ..., at most 64 fields per command.
+fn appendHash(mut buf: Bytes, key: String, h: Map[String, String]) -> () {
+    let mut words: Vec[String] = toVec(["HSET", key])
+    for (f, v) in h {
+        push(words, f)
+        push(words, v)
+        if len(words) >= 130 {
+            appendCommand(buf, words)
+            words = toVec(["HSET", key])
+        }
+    }
+    if len(words) > 2 {
+        appendCommand(buf, words)
+    }
+}
+
+// RPUSH k v v ..., at most 64 values per command.
+fn appendList(mut buf: Bytes, key: String, d: Deque) -> () {
+    let mut words: Vec[String] = toVec(["RPUSH", key])
+    let mut i = 0
+    while i < d.size() {
+        push(words, d.at(i))
+        if len(words) >= 66 {
+            appendCommand(buf, words)
+            words = toVec(["RPUSH", key])
+        }
+        i += 1
+    }
+    if len(words) > 2 {
+        appendCommand(buf, words)
+    }
+}

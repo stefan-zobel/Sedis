@@ -1,0 +1,86 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 780 449" width="780" height="449" role="img" aria-label="How Sedis is built. actors that share nothing: every message is copied">
+<title>How Sedis is built. actors that share nothing: every message is copied</title>
+<style>
+svg{--surface:#ffffff;--ink:#17202c;--muted:#586476;--faint:#8b95a5;--rule:#dbe0e7;--grid:#e7ebf0;--skarn:#0b7d74;--skarn1:#5fb3aa;--asyncio:#3572a5;--threads:#8a94a6;--ftthreads:#b3306b;--memurai:#7a4fa3;--gc:#c0392b}
+@media (prefers-color-scheme: dark){svg{--surface:#161b22;--ink:#e6ebf1;--muted:#a2adbd;--faint:#74808f;--rule:#2b3440;--grid:#232b36;--skarn:#3cc2b4;--skarn1:#8adfd5;--asyncio:#6aa6dc;--threads:#9aa4b5;--ftthreads:#ec79a8;--memurai:#b38ae0;--gc:#f07c6c}}
+.bg{fill:var(--surface);stroke:var(--rule)}
+text{font-family:ui-monospace, SFMono-Regular, 'Cascadia Mono', Consolas, Menlo, monospace;font-size:12px;fill:var(--muted)}
+.t{font-family:-apple-system, 'Segoe UI', 'Helvetica Neue', Helvetica, Arial, sans-serif;font-size:16px;font-weight:600;fill:var(--ink)}
+.st{font-family:-apple-system, 'Segoe UI', 'Helvetica Neue', Helvetica, Arial, sans-serif;font-size:12.5px;fill:var(--muted)}
+.ax{font-family:-apple-system, 'Segoe UI', 'Helvetica Neue', Helvetica, Arial, sans-serif;font-size:12px;fill:var(--faint)}
+.lab{font-family:-apple-system, 'Segoe UI', 'Helvetica Neue', Helvetica, Arial, sans-serif;font-size:13px;fill:var(--ink)}
+.box{font-family:-apple-system, 'Segoe UI', 'Helvetica Neue', Helvetica, Arial, sans-serif;font-size:13px;fill:var(--ink)}
+.small{font-family:-apple-system, 'Segoe UI', 'Helvetica Neue', Helvetica, Arial, sans-serif;font-size:11.5px;fill:var(--muted)}
+.val{fill:var(--ink);font-weight:600}
+.g{stroke:var(--grid);stroke-width:1}
+.b{stroke:var(--rule);stroke-width:1}
+.frame{fill:none;stroke:var(--faint);stroke-width:1.2}
+.arrow{stroke:var(--muted);stroke-width:1.4;fill:none;marker-end:url(#ah)}
+.whisk{stroke:var(--ink);stroke-width:1;opacity:.55}
+.pale{fill-opacity:.35}
+.f-skarn{fill:var(--skarn)} .s-skarn{stroke:var(--skarn);fill:none}
+.f-skarn1{fill:var(--skarn1)} .s-skarn1{stroke:var(--skarn1);fill:none}
+.f-asyncio{fill:var(--asyncio)} .s-asyncio{stroke:var(--asyncio);fill:none}
+.f-threads{fill:var(--threads)} .s-threads{stroke:var(--threads);fill:none}
+.f-ftthreads{fill:var(--ftthreads)} .s-ftthreads{stroke:var(--ftthreads);fill:none}
+.f-memurai{fill:var(--memurai)} .s-memurai{stroke:var(--memurai);fill:none}
+.f-gc{fill:var(--gc)} .s-gc{stroke:var(--gc);fill:none}
+</style>
+<rect class="bg" x="0.5" y="0.5" width="779" height="448" rx="10"/>
+<text class="t" x="24" y="34">How Sedis is built</text>
+<text class="st" x="24" y="55">actors that share nothing: every message is copied</text>
+<defs><marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+<rect x="24" y="110" width="120" height="60" rx="8" class="f-threads" fill-opacity=".14"/>
+<rect x="24" y="110" width="120" height="60" rx="8" class="frame"/>
+<text x="84" y="132" text-anchor="middle" class="box">clients</text>
+<text x="84" y="150" text-anchor="middle" class="small">RESP over TCP</text>
+<rect x="186" y="80" width="150" height="50" rx="8" class="f-skarn" fill-opacity=".14"/>
+<rect x="186" y="80" width="150" height="50" rx="8" class="frame"/>
+<text x="261" y="97" text-anchor="middle" class="box">acceptor</text>
+<text x="261" y="115" text-anchor="middle" class="small">an activated listener</text>
+<rect x="198" y="178" width="150" height="56" rx="8" class="f-skarn" fill-opacity=".10"/>
+<rect x="198" y="178" width="150" height="56" rx="8" class="frame"/>
+<rect x="192" y="172" width="150" height="56" rx="8" class="f-skarn" fill-opacity=".10"/>
+<rect x="192" y="172" width="150" height="56" rx="8" class="frame"/>
+<rect x="186" y="166" width="150" height="56" rx="8" class="bg"/>
+<rect x="186" y="166" width="150" height="56" rx="8" class="f-skarn" fill-opacity=".14"/>
+<rect x="186" y="166" width="150" height="56" rx="8" class="frame"/>
+<text x="261" y="186" text-anchor="middle" class="box">connection</text>
+<text x="261" y="204" text-anchor="middle" class="small">one actor per client</text>
+<rect x="430" y="92" width="150" height="48" rx="8" class="f-skarn" fill-opacity=".14"/>
+<rect x="430" y="92" width="150" height="48" rx="8" class="frame"/>
+<text x="505" y="108" text-anchor="middle" class="box">shard 0</text>
+<text x="505" y="126" text-anchor="middle" class="small">a heap of its own</text>
+<rect x="430" y="148" width="150" height="48" rx="8" class="f-skarn" fill-opacity=".14"/>
+<rect x="430" y="148" width="150" height="48" rx="8" class="frame"/>
+<text x="505" y="164" text-anchor="middle" class="box">shard 1</text>
+<text x="505" y="182" text-anchor="middle" class="small">a heap of its own</text>
+<rect x="430" y="204" width="150" height="48" rx="8" class="f-skarn" fill-opacity=".14"/>
+<rect x="430" y="204" width="150" height="48" rx="8" class="frame"/>
+<text x="505" y="220" text-anchor="middle" class="box">shard 2, 3 …</text>
+<text x="505" y="238" text-anchor="middle" class="small">a heap of its own</text>
+<rect x="620" y="128" width="140" height="56" rx="8" class="f-memurai" fill-opacity=".14"/>
+<rect x="620" y="128" width="140" height="56" rx="8" class="frame"/>
+<text x="690" y="148" text-anchor="middle" class="box">supervisor</text>
+<text x="690" y="166" text-anchor="middle" class="small">restarts a crashed shard</text>
+<rect x="430" y="268" width="150" height="46" rx="8" class="f-skarn1" fill-opacity=".14"/>
+<rect x="430" y="268" width="150" height="46" rx="8" class="frame"/>
+<text x="505" y="283" text-anchor="middle" class="box">append-only log</text>
+<text x="505" y="301" text-anchor="middle" class="small">one file per shard</text>
+<path d="M144,130 L186,108" class="arrow"/>
+<path d="M144,150 L186,196" class="arrow"/>
+<path d="M261,130 L261,166" class="arrow"/>
+<path d="M348,196 L430,116" class="arrow"/>
+<path d="M348,196 L430,172" class="arrow"/>
+<path d="M348,196 L430,228" class="arrow"/>
+<path d="M620,156 L580,116" class="arrow"/>
+<path d="M620,156 L580,172" class="arrow"/>
+<path d="M620,156 L580,228" class="arrow"/>
+<path d="M505,252 L505,268" class="arrow"/>
+<text x="24" y="344" class="small">A command goes to the shard its key hashes to; all commands of one socket read go to a shard as one message, and come</text>
+<text x="24" y="361" class="small">back as one.</text>
+<text x="24" y="378" class="small">Each shard lives in a slot, an address that outlives its actor: a restarted shard answers where its predecessor did,</text>
+<text x="24" y="395" class="small">and a send in between waits instead of being dropped.</text>
+<text x="24" y="412" class="small">A shard appends the EFFECT of a command to its own log — the resulting state, not the request — and replays it before</text>
+<text x="24" y="429" class="small">the acceptor starts.</text>
+</svg>

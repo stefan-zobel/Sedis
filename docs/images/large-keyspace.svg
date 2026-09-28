@@ -1,0 +1,63 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 780 350" width="780" height="350" role="img" aria-label="A million keys: the slowest answer. SET on random keys of 1,000,000, 16 clients · p99 stays near 1 ms for all; the worst case differs">
+<title>A million keys: the slowest answer. SET on random keys of 1,000,000, 16 clients · p99 stays near 1 ms for all; the worst case differs</title>
+<style>
+svg{--surface:#ffffff;--ink:#17202c;--muted:#586476;--faint:#8b95a5;--rule:#dbe0e7;--grid:#e7ebf0;--skarn:#0b7d74;--skarn1:#5fb3aa;--asyncio:#3572a5;--threads:#8a94a6;--ftthreads:#b3306b;--memurai:#7a4fa3;--gc:#c0392b}
+@media (prefers-color-scheme: dark){svg{--surface:#161b22;--ink:#e6ebf1;--muted:#a2adbd;--faint:#74808f;--rule:#2b3440;--grid:#232b36;--skarn:#3cc2b4;--skarn1:#8adfd5;--asyncio:#6aa6dc;--threads:#9aa4b5;--ftthreads:#ec79a8;--memurai:#b38ae0;--gc:#f07c6c}}
+.bg{fill:var(--surface);stroke:var(--rule)}
+text{font-family:ui-monospace, SFMono-Regular, 'Cascadia Mono', Consolas, Menlo, monospace;font-size:12px;fill:var(--muted)}
+.t{font-family:-apple-system, 'Segoe UI', 'Helvetica Neue', Helvetica, Arial, sans-serif;font-size:16px;font-weight:600;fill:var(--ink)}
+.st{font-family:-apple-system, 'Segoe UI', 'Helvetica Neue', Helvetica, Arial, sans-serif;font-size:12.5px;fill:var(--muted)}
+.ax{font-family:-apple-system, 'Segoe UI', 'Helvetica Neue', Helvetica, Arial, sans-serif;font-size:12px;fill:var(--faint)}
+.lab{font-family:-apple-system, 'Segoe UI', 'Helvetica Neue', Helvetica, Arial, sans-serif;font-size:13px;fill:var(--ink)}
+.box{font-family:-apple-system, 'Segoe UI', 'Helvetica Neue', Helvetica, Arial, sans-serif;font-size:13px;fill:var(--ink)}
+.small{font-family:-apple-system, 'Segoe UI', 'Helvetica Neue', Helvetica, Arial, sans-serif;font-size:11.5px;fill:var(--muted)}
+.val{fill:var(--ink);font-weight:600}
+.g{stroke:var(--grid);stroke-width:1}
+.b{stroke:var(--rule);stroke-width:1}
+.frame{fill:none;stroke:var(--faint);stroke-width:1.2}
+.arrow{stroke:var(--muted);stroke-width:1.4;fill:none;marker-end:url(#ah)}
+.whisk{stroke:var(--ink);stroke-width:1;opacity:.55}
+.pale{fill-opacity:.35}
+.f-skarn{fill:var(--skarn)} .s-skarn{stroke:var(--skarn);fill:none}
+.f-skarn1{fill:var(--skarn1)} .s-skarn1{stroke:var(--skarn1);fill:none}
+.f-asyncio{fill:var(--asyncio)} .s-asyncio{stroke:var(--asyncio);fill:none}
+.f-threads{fill:var(--threads)} .s-threads{stroke:var(--threads);fill:none}
+.f-ftthreads{fill:var(--ftthreads)} .s-ftthreads{stroke:var(--ftthreads);fill:none}
+.f-memurai{fill:var(--memurai)} .s-memurai{stroke:var(--memurai);fill:none}
+.f-gc{fill:var(--gc)} .s-gc{stroke:var(--gc);fill:none}
+</style>
+<rect class="bg" x="0.5" y="0.5" width="779" height="349" rx="10"/>
+<text class="t" x="24" y="34">A million keys: the slowest answer</text>
+<text class="st" x="24" y="55">SET on random keys of 1,000,000, 16 clients · p99 stays near 1 ms for all; the worst case differs</text>
+<line x1="200.0" y1="74" x2="200.0" y2="288" class="b"/>
+<text x="200.0" y="304" text-anchor="middle">0</text>
+<line x1="272.0" y1="74" x2="272.0" y2="288" class="g"/>
+<text x="272.0" y="304" text-anchor="middle">20</text>
+<line x1="344.0" y1="74" x2="344.0" y2="288" class="g"/>
+<text x="344.0" y="304" text-anchor="middle">40</text>
+<line x1="416.0" y1="74" x2="416.0" y2="288" class="g"/>
+<text x="416.0" y="304" text-anchor="middle">60</text>
+<line x1="488.0" y1="74" x2="488.0" y2="288" class="g"/>
+<text x="488.0" y="304" text-anchor="middle">80</text>
+<text x="344.0" y="324" text-anchor="middle" class="ax">milliseconds · bar: the slowest round trip in 5 s · red mark: the longest GC pause</text>
+<text x="188" y="96" text-anchor="end" class="lab">Sedis, 1 shard</text>
+<rect x="200" y="83" width="259.9" height="18" rx="2" class="f-skarn1"/>
+<line x1="458.4" y1="80" x2="458.4" y2="104" class="s-gc" stroke-width="3"/>
+<text x="468.9" y="96" class="val">72.2 ms  (GC 71.8 ms)</text>
+<text x="188" y="132" text-anchor="end" class="lab">Sedis, 4 shards</text>
+<rect x="200" y="119" width="52.6" height="18" rx="2" class="f-skarn"/>
+<line x1="251.8" y1="116" x2="251.8" y2="140" class="s-gc" stroke-width="3"/>
+<text x="261.6" y="132" class="val">14.6 ms  (GC 14.4 ms)</text>
+<text x="188" y="168" text-anchor="end" class="lab">Python asyncio</text>
+<rect x="200" y="155" width="21.8" height="18" rx="2" class="f-asyncio"/>
+<text x="230.8" y="168" class="val">6.0 ms</text>
+<text x="188" y="204" text-anchor="end" class="lab">Python threads (GIL)</text>
+<rect x="200" y="191" width="37.6" height="18" rx="2" class="f-threads"/>
+<text x="246.6" y="204" class="val">10.4 ms</text>
+<text x="188" y="240" text-anchor="end" class="lab">Python free-threaded</text>
+<rect x="200" y="227" width="28.8" height="18" rx="2" class="f-ftthreads"/>
+<text x="237.8" y="240" class="val">8.0 ms</text>
+<text x="188" y="276" text-anchor="end" class="lab">Memurai (C++)</text>
+<rect x="200" y="263" width="8.6" height="18" rx="2" class="f-memurai"/>
+<text x="217.6" y="276" class="val">2.4 ms</text>
+</svg>

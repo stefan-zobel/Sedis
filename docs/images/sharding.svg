@@ -1,0 +1,66 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 780 360" width="780" height="360" role="img" aria-label="Sharding: which shard a key belongs to. a key's hash decides, and a multi-key command is split and merged">
+<title>Sharding: which shard a key belongs to. a key's hash decides, and a multi-key command is split and merged</title>
+<style>
+svg{--surface:#ffffff;--ink:#17202c;--muted:#586476;--faint:#8b95a5;--rule:#dbe0e7;--grid:#e7ebf0;--skarn:#0b7d74;--skarn1:#5fb3aa;--asyncio:#3572a5;--threads:#8a94a6;--ftthreads:#b3306b;--memurai:#7a4fa3;--gc:#c0392b}
+@media (prefers-color-scheme: dark){svg{--surface:#161b22;--ink:#e6ebf1;--muted:#a2adbd;--faint:#74808f;--rule:#2b3440;--grid:#232b36;--skarn:#3cc2b4;--skarn1:#8adfd5;--asyncio:#6aa6dc;--threads:#9aa4b5;--ftthreads:#ec79a8;--memurai:#b38ae0;--gc:#f07c6c}}
+.bg{fill:var(--surface);stroke:var(--rule)}
+text{font-family:ui-monospace, SFMono-Regular, 'Cascadia Mono', Consolas, Menlo, monospace;font-size:12px;fill:var(--muted)}
+.t{font-family:-apple-system, 'Segoe UI', 'Helvetica Neue', Helvetica, Arial, sans-serif;font-size:16px;font-weight:600;fill:var(--ink)}
+.st{font-family:-apple-system, 'Segoe UI', 'Helvetica Neue', Helvetica, Arial, sans-serif;font-size:12.5px;fill:var(--muted)}
+.ax{font-family:-apple-system, 'Segoe UI', 'Helvetica Neue', Helvetica, Arial, sans-serif;font-size:12px;fill:var(--faint)}
+.lab{font-family:-apple-system, 'Segoe UI', 'Helvetica Neue', Helvetica, Arial, sans-serif;font-size:13px;fill:var(--ink)}
+.box{font-family:-apple-system, 'Segoe UI', 'Helvetica Neue', Helvetica, Arial, sans-serif;font-size:13px;fill:var(--ink)}
+.small{font-family:-apple-system, 'Segoe UI', 'Helvetica Neue', Helvetica, Arial, sans-serif;font-size:11.5px;fill:var(--muted)}
+.val{fill:var(--ink);font-weight:600}
+.g{stroke:var(--grid);stroke-width:1}
+.b{stroke:var(--rule);stroke-width:1}
+.frame{fill:none;stroke:var(--faint);stroke-width:1.2}
+.arrow{stroke:var(--muted);stroke-width:1.4;fill:none;marker-end:url(#ah)}
+.whisk{stroke:var(--ink);stroke-width:1;opacity:.55}
+.pale{fill-opacity:.35}
+.f-skarn{fill:var(--skarn)} .s-skarn{stroke:var(--skarn);fill:none}
+.f-skarn1{fill:var(--skarn1)} .s-skarn1{stroke:var(--skarn1);fill:none}
+.f-asyncio{fill:var(--asyncio)} .s-asyncio{stroke:var(--asyncio);fill:none}
+.f-threads{fill:var(--threads)} .s-threads{stroke:var(--threads);fill:none}
+.f-ftthreads{fill:var(--ftthreads)} .s-ftthreads{stroke:var(--ftthreads);fill:none}
+.f-memurai{fill:var(--memurai)} .s-memurai{stroke:var(--memurai);fill:none}
+.f-gc{fill:var(--gc)} .s-gc{stroke:var(--gc);fill:none}
+</style>
+<rect class="bg" x="0.5" y="0.5" width="779" height="359" rx="10"/>
+<text class="t" x="24" y="34">Sharding: which shard a key belongs to</text>
+<text class="st" x="24" y="55">a key's hash decides, and a multi-key command is split and merged</text>
+<defs><marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+<rect x="24" y="108" width="190" height="56" rx="8" class="f-threads" fill-opacity=".14"/>
+<rect x="24" y="108" width="190" height="56" rx="8" class="frame"/>
+<text x="119" y="128" text-anchor="middle" class="box">MGET k1 k2 k3</text>
+<text x="119" y="146" text-anchor="middle" class="small">one command, three keys</text>
+<rect x="254" y="108" width="160" height="56" rx="8" class="f-skarn" fill-opacity=".14"/>
+<rect x="254" y="108" width="160" height="56" rx="8" class="frame"/>
+<text x="334" y="128" text-anchor="middle" class="box">FNV-1a mod N</text>
+<text x="334" y="146" text-anchor="middle" class="small">the key picks the shard</text>
+<rect x="454" y="72" width="150" height="46" rx="8" class="f-skarn" fill-opacity=".14"/>
+<rect x="454" y="72" width="150" height="46" rx="8" class="frame"/>
+<text x="529" y="100" text-anchor="middle" class="box">shard 0  ←  k1</text>
+<rect x="454" y="128" width="150" height="46" rx="8" class="f-skarn" fill-opacity=".14"/>
+<rect x="454" y="128" width="150" height="46" rx="8" class="frame"/>
+<text x="529" y="156" text-anchor="middle" class="box">shard 1  ←  k3</text>
+<rect x="454" y="184" width="150" height="46" rx="8" class="f-skarn" fill-opacity=".14"/>
+<rect x="454" y="184" width="150" height="46" rx="8" class="frame"/>
+<text x="529" y="212" text-anchor="middle" class="box">shard 2  ←  k2</text>
+<rect x="644" y="128" width="112" height="56" rx="8" class="f-memurai" fill-opacity=".14"/>
+<rect x="644" y="128" width="112" height="56" rx="8" class="frame"/>
+<text x="700" y="148" text-anchor="middle" class="box">merge</text>
+<text x="700" y="166" text-anchor="middle" class="small">one answer</text>
+<path d="M214,136 L254,136" class="arrow"/>
+<path d="M414,132 L454,95" class="arrow"/>
+<path d="M414,136 L454,151" class="arrow"/>
+<path d="M414,140 L454,207" class="arrow"/>
+<path d="M604,95 L644,150" class="arrow"/>
+<path d="M604,151 L644,154" class="arrow"/>
+<path d="M604,207 L644,158" class="arrow"/>
+<text x="24" y="272" class="small">A shard is a whole key-value store with a heap of its own, so a collection stops one shard and not the server: four</text>
+<text x="24" y="289" class="small">shards divide the pause by four.</text>
+<text x="24" y="306" class="small">A multi-key command is cut along the shards and put back together by the merge it needs — Sum (DEL, EXISTS), AllOk</text>
+<text x="24" y="323" class="small">(MSET), Gather (MGET), Concat.</text>
+<text x="24" y="340" class="small">The order of the answer follows the order of the request, not the order the shards answered in.</text>
+</svg>

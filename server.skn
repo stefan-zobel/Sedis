@@ -1,0 +1,807 @@
+// The network side: the acceptor, and one connection actor per client.
+//
+// A connection actor reads commands as they arrive, sends each to the shard of
+// its key -- all the commands of one read together, one Batch per shard -- and
+// writes the answers back in the order the commands came, however the shards
+// interleave. That order is what makes pipelining work: a client may send many
+// commands before it reads the first answer. Each command gets a sequence
+// number; its answer waits in `pending` until every earlier one has been
+// written.
+//
+// A SHARD MAY CRASH, and then its supervisor starts it again at the same
+// address. What was on its way to the crashed shard is lost -- a slot drops the
+// mail its actor had not read -- so a connection must notice which of its
+// batches will never be answered. It numbers its batches per shard, and a
+// shard answers them in the order they were sent. An answer to batch k
+// therefore means that every earlier batch still open was lost; those commands
+// are answered with an error. A connection that has waited a second for a
+// shard sends it an empty batch, whose answer settles the question, so a lost
+// batch is found even when nothing else follows it.
+
+import commands
+import shard
+use commands::*
+use shard::*
+use std::actor::*
+use std::env::*
+use std::log::*
+use std::net::*
+use std::resp::*
+use std::supervisor::*
+
+
+// How long a connection waits for a shard before it asks, in milliseconds.
+const PROBE_AFTER: Int = 1000
+
+// How the answers of the parts of one command become its answer.
+//   One     one part, taken as it is
+//   Sum     integers, added up (DEL, EXISTS, DBSIZE)
+//   AllOk   OK if every part is (MSET, FLUSHDB)
+//   Gather  arrays put back in order: per part the positions of its items,
+//           and how many items there are in all
+//   Concat  arrays joined (KEYS)
+enum Merge {
+    One,
+    Sum,
+    AllOk,
+    Gather(Vec[Vec[Int]], Int),
+    Concat
+}
+
+// A command that is waiting for its answer. `answered` says which parts are
+// in: a part answered as lost must not be counted again if its real answer
+// turns up after all.
+struct Pending {
+    need: Int,
+    got: Int,
+    merge: Merge,
+    parts: Vec[Resp],
+    answered: Vec[Bool]
+}
+
+// A batch sent to a shard and not answered yet: when, and which parts of
+// which commands it holds.
+struct Sent {
+    at: Int,
+    seqs: Vec[Int],
+    parts: Vec[Int]
+}
+
+struct Conn {
+    shards: Vec[Pid[ShardMsg]],
+    me: Pid[Answer],
+    out: ActiveConn,
+    reader: RespReader,
+    nextSeq: Int,
+    writeSeq: Int,
+    pending: Map[Int, Pending],
+    batches: Map[Int, Vec[Part]],
+    // per shard: the next batch number, the batches still open, and when it
+    // was last asked with an empty batch
+    nextBatch: Vec[Int],
+    open: Vec[Map[Int, Sent]],
+    probed: Vec[Int],
+    quitting: Bool,
+    logged: Bool,
+    debug: Bool
+}
+
+pub struct ConnStart {
+    ticket: SocketHandOff,
+    shards: Vec[Pid[ShardMsg]],
+    logged: Bool,
+    debug: Bool
+}
+
+fn ready(value: Resp) -> Pending {
+    Pending {
+        need: 0,
+        got: 0,
+        merge: Merge::One,
+        parts: toVec([value]),
+        answered: toVec([true])
+    }
+}
+
+fn waiting(need: Int, merge: Merge) -> Pending {
+    let mut parts: Vec[Resp] = vec()
+    let mut answered: Vec[Bool] = vec()
+    let mut i = 0
+    while i < need {
+        push(parts, Resp::Null)
+        push(answered, false)
+        i += 1
+    }
+    Pending {
+        need: need,
+        got: 0,
+        merge: merge,
+        parts: parts,
+        answered: answered
+    }
+}
+
+// Queue a part for its shard; the batches go out once the whole read has been
+// gone through.
+fn toShard(mut c: Conn, shard: Int, p: Part) -> () {
+    match get(c.batches, shard) {
+        Some(v) => {
+            let mut parts = v
+            push(parts, p)
+        },
+        None => { c.batches[shard] = toVec([p]) }
+    }
+}
+
+// Split the keys args[from..] (every `step`-th word; MSET's pairs have step 2)
+// by shard. Answers, per shard used: its index, the words it gets, and the
+// positions of its keys among all keys.
+struct Split {
+    shard: Int,
+    words: Vec[String],
+    positions: Vec[Int]
+}
+
+fn splitKeys(c: Conn, args: Vec[String], step: Int) -> Vec[Split] {
+    let n = len(c.shards)
+    let mut byShard: Map[Int, Split] = #{}
+    let mut order: Vec[Int] = vec()
+    let mut i = 1
+    let mut k = 0
+    while i < len(args) {
+        let s = shardOf(args[i], n)
+        if !has(byShard, s) {
+            byShard[s] = Split {
+                shard: s,
+                words: toVec([args[0]]),
+                positions: vec()
+            }
+            push(order, s)
+        }
+        let sp = byShard[s]
+        let mut words = sp.words
+        let mut positions = sp.positions
+        push(words, args[i])
+        if step == 2 {
+            push(words, args[i + 1])
+        }
+        push(positions, k)
+        i += step
+        k += 1
+    }
+    let mut out: Vec[Split] = vec()
+    for s in order {
+        push(out, byShard[s])
+    }
+    out
+}
+
+// Take one command: answer it here, or send it (or its parts) to the shards.
+fn dispatch(mut c: Conn, args: Vec[String]) -> () {
+    let seq = c.nextSeq
+    c.nextSeq += 1
+    let name = toUpper(args[0])
+    let spec = match specOf(name) {
+        Some(s) => s,
+        None => {
+            c.pending[seq] = ready(unknownCommand(args))
+            return ()
+        }
+    }
+    if !arityOk(name, spec, len(args)) {
+        c.pending[seq] = ready(wrongArity(name))
+        return ()
+    }
+    match spec.route {
+        Route::Local => { c.pending[seq] = ready(local(c, name, args)) },
+        Route::OneKey => {
+            c.pending[seq] = waiting(1, Merge::One)
+            toShard(
+                c,
+                shardOf(args[1], len(c.shards)),
+                Part { seq: seq, part: 0, name: name, args: args }
+            )
+        },
+        Route::DelLike => {
+            let splits = splitKeys(c, args, 1)
+            c.pending[seq] = waiting(len(splits), Merge::Sum)
+            let mut p = 0
+            for sp in splits {
+                toShard(
+                    c,
+                    sp.shard,
+                    Part { seq: seq, part: p, name: name, args: sp.words }
+                )
+                p += 1
+            }
+        },
+        Route::GetLike => {
+            let splits = splitKeys(c, args, 1)
+            let mut positions: Vec[Vec[Int]] = vec()
+            for sp in splits {
+                push(positions, sp.positions)
+            }
+            c.pending[seq] = waiting(
+                len(splits),
+                Merge::Gather(positions, len(args) - 1)
+            )
+            let mut p = 0
+            for sp in splits {
+                toShard(
+                    c,
+                    sp.shard,
+                    Part { seq: seq, part: p, name: name, args: sp.words }
+                )
+                p += 1
+            }
+        },
+        Route::SetLike => {
+            let splits = splitKeys(c, args, 2)
+            c.pending[seq] = waiting(len(splits), Merge::AllOk)
+            let mut p = 0
+            for sp in splits {
+                toShard(
+                    c,
+                    sp.shard,
+                    Part { seq: seq, part: p, name: name, args: sp.words }
+                )
+                p += 1
+            }
+        },
+        Route::AllSum => { broadcast(c, seq, name, args, Merge::Sum) },
+        Route::AllOk => { broadcast(c, seq, name, args, Merge::AllOk) },
+        Route::AllConcat => { broadcast(c, seq, name, args, Merge::Concat) },
+        Route::Debug => { debugCommand(c, seq, args) }
+    }
+}
+
+// DEBUG CRASH key: the shard that holds `key` crashes -- the poison message
+// that shows a supervised shard coming back. Only with --enable-debug.
+fn debugCommand(mut c: Conn, seq: Int, args: Vec[String]) -> () {
+    if !c.debug {
+        c.pending[seq] = ready(
+            Resp::Error("ERR DEBUG is off (start sedis with --enable-debug)")
+        )
+        return ()
+    }
+    if toUpper(args[1]) != "CRASH" {
+        c.pending[seq] = ready(
+            Resp::Error("ERR unknown DEBUG subcommand '" + args[1] + "'")
+        )
+        return ()
+    }
+    c.pending[seq] = waiting(1, Merge::One)
+    toShard(
+        c,
+        shardOf(args[2], len(c.shards)),
+        Part { seq: seq, part: 0, name: "DEBUG", args: args }
+    )
+}
+
+fn broadcast(
+    mut c: Conn,
+    seq: Int,
+    name: String,
+    args: Vec[String],
+    merge: Merge
+) -> () {
+    let n = len(c.shards)
+    c.pending[seq] = waiting(n, merge)
+    let mut s = 0
+    while s < n {
+        toShard(c, s, Part { seq: seq, part: s, name: name, args: args })
+        s += 1
+    }
+}
+
+// The commands a connection answers itself.
+fn local(mut c: Conn, name: String, args: Vec[String]) -> Resp {
+    if name == "QUIT" {
+        c.quitting = true
+        return Resp::Simple("OK")
+    }
+    localCommand(name, args, c.logged)
+}
+
+// Send one batch to shard `s`, and remember it until it is answered.
+fn sendBatch(mut c: Conn, s: Int, parts: Vec[Part], now: Int) -> () {
+    let id = c.nextBatch[s]
+    let mut ids = c.nextBatch
+    ids[s] = id + 1
+    let mut seqs: Vec[Int] = vec()
+    let mut nums: Vec[Int] = vec()
+    for p in parts {
+        push(seqs, p.seq)
+        push(nums, p.part)
+    }
+    let mut open = c.open[s]
+    open[id] = Sent { at: now, seqs: seqs, parts: nums }
+    send(c.shards[s], ShardMsg::Batch(c.me, id, parts))
+}
+
+// Send every queued batch.
+fn flush(mut c: Conn) -> () {
+    let now = millisTime()
+    for (s, parts) in c.batches {
+        sendBatch(c, s, parts, now)
+    }
+    c.batches = #{}
+}
+
+// Put one part's answer in place, unless that part has been answered already.
+fn fill(mut c: Conn, seq: Int, part: Int, value: Resp) -> () {
+    match get(c.pending, seq) {
+        Some(p) => {
+            let mut pe = p
+            let mut done = pe.answered
+            if !done[part] {
+                let mut parts = pe.parts
+                parts[part] = value
+                done[part] = true
+                pe.got += 1
+            }
+        },
+        None => {}
+    }
+}
+
+fn restarted() -> Resp {
+    Resp::Error(
+        "ERR the shard restarted before it answered; the command may or may"
+            + " not have run"
+    )
+}
+
+// An answer came back from a shard. Every batch sent to that shard before this
+// one and still open was lost with the shard that crashed.
+fn onAnswer(mut c: Conn, a: Answer) -> () {
+    let mut open = c.open[a.shard]
+    let _d = delete(open, a.id)
+    for d in a.done {
+        fill(c, d.seq, d.part, d.value)
+    }
+    let mut lost: Vec[Int] = vec()
+    for (id, _) in open {
+        if id < a.id {
+            push(lost, id)
+        }
+    }
+    for id in lost {
+        let s = open[id]
+        let mut i = 0
+        while i < len(s.seqs) {
+            fill(c, s.seqs[i], s.parts[i], restarted())
+            i += 1
+        }
+        let _l = delete(open, id)
+    }
+}
+
+// Ask each shard that has kept this connection waiting for a second: an empty
+// batch, answered only after everything sent before it -- or showing that it
+// was lost.
+fn probe(mut c: Conn) -> () {
+    let now = millisTime()
+    let mut s = 0
+    while s < len(c.shards) {
+        let mut oldest = now
+        for (_, sent) in c.open[s] {
+            if sent.at < oldest {
+                oldest = sent.at
+            }
+        }
+        if now - oldest >= PROBE_AFTER && now - c.probed[s] >= PROBE_AFTER {
+            let mut probed = c.probed
+            probed[s] = now
+            sendBatch(c, s, vec(), now)
+        }
+        s += 1
+    }
+}
+
+fn waitingOnShards(c: Conn) -> Bool {
+    for m in c.open {
+        if len(m) > 0 {
+            return true
+        }
+    }
+    false
+}
+
+// The answer of a command whose parts have all come back.
+fn merged(p: Pending) -> Resp {
+    match p.merge {
+        Merge::One => p.parts[0],
+        Merge::Sum => {
+            let mut total = 0
+            for r in p.parts {
+                match r {
+                    Resp::Integer(n) => { total += n },
+                    other => return other
+                }
+            }
+            Resp::Integer(total)
+        },
+        Merge::Concat => {
+            let mut out: Vec[Resp] = vec()
+            for r in p.parts {
+                match r {
+                    Resp::Arr(items) => {
+                        for it in items {
+                            push(out, it)
+                        }
+                    },
+                    other => return other
+                }
+            }
+            Resp::Arr(out)
+        },
+        Merge::AllOk => {
+            for r in p.parts {
+                match r {
+                    Resp::Error(e) => return Resp::Error(e),
+                    _ => {}
+                }
+            }
+            Resp::Simple("OK")
+        },
+        Merge::Gather(positions, total) => {
+            let mut out: Vec[Resp] = vec()
+            let mut i = 0
+            while i < total {
+                push(out, Resp::Null)
+                i += 1
+            }
+            let mut part = 0
+            for r in p.parts {
+                match r {
+                    Resp::Arr(items) => {
+                        let at = positions[part]
+                        let mut j = 0
+                        for it in items {
+                            out[at[j]] = it
+                            j += 1
+                        }
+                    },
+                    other => return other
+                }
+                part += 1
+            }
+            Resp::Arr(out)
+        }
+    }
+}
+
+// Write, in order, every answer that is complete and has no earlier one still
+// missing. False once the connection is gone.
+fn writeReady(mut c: Conn) -> Bool {
+    let mut out = bytes()
+    let mut going = true
+    while going {
+        match get(c.pending, c.writeSeq) {
+            Some(p) => {
+                if p.got >= p.need {
+                    appendResp(out, merged(p))
+                    delete(c.pending, c.writeSeq)
+                    c.writeSeq += 1
+                } else {
+                    going = false
+                }
+            },
+            None => { going = false }
+        }
+    }
+    if len(out) == 0 {
+        return true
+    }
+    match c.out.send(out) {
+        Ok(_) => true,
+        Err(_) => false
+    }
+}
+
+fn perShard[T](n: Int, v: T) -> Vec[T] {
+    let mut out: Vec[T] = vec()
+    let mut i = 0
+    while i < n {
+        push(out, v)
+        i += 1
+    }
+    out
+}
+
+// One client, from its first command to its last.
+pub fn connection(inbox: Inbox[Answer], start: ConnStart) -> () {
+    let conn = match start.ticket.take() {
+        Ok(t) => t,
+        Err(_) => return ()
+    }
+    let (out, events) = match conn.activate(Framing::Raw, 16) {
+        Ok(pair) => pair,
+        Err(_) => return ()
+    }
+    // A client that stops reading may hold this actor in a send for at most
+    // 10 s.
+    out.setSendTimeout(10000)
+    let n = len(start.shards)
+    let mut open: Vec[Map[Int, Sent]] = vec()
+    let mut i = 0
+    while i < n {
+        let m: Map[Int, Sent] = #{}
+        push(open, m)
+        i += 1
+    }
+    let mut c = Conn {
+        shards: start.shards,
+        me: inbox.pid(),
+        out: out,
+        reader: RespReader::new(),
+        nextSeq: 0,
+        writeSeq: 0,
+        pending: #{},
+        batches: #{},
+        nextBatch: perShard(n, 0),
+        open: open,
+        probed: perShard(n, 0),
+        quitting: false,
+        logged: start.logged,
+        debug: start.debug
+    }
+    // Answers first: they free the client to send more.
+    let watching = toVec([inbox.ref(), events.ref()])
+    let mut running = true
+    while running {
+        let wait = if waitingOnShards(c) { 250 } else { -1 }
+        match select(watching, wait) {
+            Some(0) => {
+                match inbox.receive() {
+                    Mail::Msg(a) => {
+                        onAnswer(c, a)
+                        running = writeReady(c)
+                    },
+                    _ => { running = false }
+                }
+            },
+            Some(_) => {
+                match events.receive() {
+                    SockEvent::Chunk(data) => { running = onBytes(c, data) },
+                    _ => { running = false }
+                }
+            },
+            None => {}
+        }
+        if running && waitingOnShards(c) {
+            probe(c)
+        }
+        if c.quitting && len(c.pending) == 0 {
+            running = false
+        }
+    }
+    c.out.close()
+}
+
+// Take in what the client sent: every complete command in it. False to end the
+// connection.
+fn onBytes(mut c: Conn, data: Bytes) -> Bool {
+    if c.quitting {
+        return true
+    }
+    c.reader.feed(data)
+    let mut more = true
+    while more {
+        match c.reader.nextCommand() {
+            Ok(Some(args)) => {
+                dispatch(c, args)
+                if c.quitting {
+                    more = false
+                }
+            },
+            Ok(None) => { more = false },
+            Err(e) => {
+                // Redis answers a protocol error and closes the connection.
+                c.pending[c.nextSeq] = ready(Resp::Error("ERR " + e))
+                c.nextSeq += 1
+                c.quitting = true
+                more = false
+            }
+        }
+    }
+    flush(c)
+    writeReady(c)
+}
+
+// ---- the server's own messages ----
+
+// Where they go: standard output (an error: standard error), and a log file
+// with time stamps and levels if there is one. Both are written line by
+// line, so a server that is killed has lost none of them.
+pub struct Say {
+    file: Option[Log]
+}
+
+pub fn say(s: Say, text: String) -> () {
+    println(text)
+    match s.file {
+        Some(l) => l.info(text),
+        None => {}
+    }
+}
+
+pub fn sayError(s: Say, text: String) -> () {
+    eprintln(text)
+    match s.file {
+        Some(l) => l.error(text),
+        None => {}
+    }
+}
+
+// ---- the acceptor ----
+
+pub struct AcceptorStart {
+    port: Int,
+    shards: Vec[Pid[ShardMsg]],
+    logged: Bool,
+    debug: Bool,
+    out: Say,
+    reply: Pid[Result[Int, String]]
+}
+
+fn acceptor(inbox: Inbox[Int], start: AcceptorStart) -> () {
+    let lst = match listen(start.port) {
+        Ok(l) => l,
+        Err(e) => {
+            send(start.reply, Err(e))
+            return ()
+        }
+    }
+    let port = match lst.localPort() {
+        Ok(p) => p,
+        Err(e) => {
+            send(start.reply, Err(e))
+            return ()
+        }
+    }
+    let (active, incoming) = match lst.activate(64) {
+        Ok(pair) => pair,
+        Err(e) => {
+            send(start.reply, Err(e))
+            return ()
+        }
+    }
+    send(start.reply, Ok(port))
+    let watching = toVec([inbox.ref(), incoming.ref()])
+    let mut running = true
+    while running {
+        match select(watching, -1) {
+            Some(0) => {
+                match inbox.receive() {
+                    Mail::Exited(_, why) => {
+                        say(start.out, "a connection crashed: ${why}")
+                    },
+                    Mail::Msg(_) => {},
+                    Mail::Stop => { running = false }
+                }
+            },
+            _ => {
+                match incoming.receive() {
+                    Incoming::NewClient(ticket) => {
+                        spawnActor(
+                            connection,
+                            ConnStart {
+                                ticket: ticket,
+                                shards: start.shards,
+                                logged: start.logged,
+                                debug: start.debug
+                            }
+                        )
+                    },
+                    Incoming::AcceptFailed(why) => {
+                        say(start.out, "accept failed: ${why}")
+                        running = false
+                    },
+                    Incoming::ListenerStopping => { running = false }
+                }
+            }
+        }
+    }
+    active.close()
+}
+
+// ---- starting it all ----
+
+// What startServer hands back: the port, and the inbox on which the shards
+// report each start after the first -- a restart after a crash.
+pub struct Running {
+    port: Int,
+    restarts: Inbox[Result[ShardUp, String]]
+}
+
+// The shards' supervisor: one child per shard, each in a slot, so that a
+// shard started again after a crash answers at the address the connections
+// already hold. More than 5 crashes within 10 s, and it gives up -- and the
+// program with it.
+struct SupStart {
+    slots: Vec[Slot[ShardMsg]],
+    starts: Vec[ShardStart]
+}
+
+fn shardSupervisor(inbox: Inbox[Int], s: SupStart) -> () {
+    let mut kids: Vec[dyn Supervised] = vec()
+    let mut i = 0
+    while i < len(s.slots) {
+        push(kids, childIn(s.slots[i], actorFn(shardMain), s.starts[i]))
+        i += 1
+    }
+    superviseWith(
+        inbox,
+        kids,
+        SupervisorSpec {
+            strategy: Strategy::OneForOne,
+            limit: RestartLimit { maxRestarts: 5, withinMs: 10000 },
+            stopTimeoutMs: 5000
+        }
+    )
+}
+
+// Start `shards` shards under their supervisor, wait until each has loaded its
+// data, then start the acceptor on `port` (0: any free one). The server runs
+// until the program ends; a supervisor that gives up is reported to the caller
+// as an Exited mail.
+pub fn startServer(
+    port: Int,
+    shards: Int,
+    persist: Persistence,
+    out: Say,
+    debug: Bool
+) -> Result[Running, String] {
+    let ups: Inbox[Result[ShardUp, String]] = newInbox()
+    let mut slots: Vec[Slot[ShardMsg]] = vec()
+    let mut pids: Vec[Pid[ShardMsg]] = vec()
+    let mut starts: Vec[ShardStart] = vec()
+    let mut i = 0
+    while i < shards {
+        let slot: Slot[ShardMsg] = newSlot()
+        push(slots, slot)
+        push(pids, slot.pid())
+        push(
+            starts,
+            ShardStart { index: i, persist: persist, ready: ups.pid() }
+        )
+        i += 1
+    }
+    spawnActor(shardSupervisor, SupStart { slots: slots, starts: starts })
+    // Replaying a large log takes as long as it takes: no deadline here.
+    let mut loaded = 0
+    while loaded < shards {
+        match ups.receive() {
+            Mail::Msg(Ok(up)) => {
+                if up.note != "" {
+                    say(out, up.note)
+                }
+                loaded += 1
+            },
+            Mail::Msg(Err(e)) => { return Err(e) },
+            Mail::Exited(_, why) => { return Err(why) },
+            Mail::Stop => { return Err("stopped while starting") }
+        }
+    }
+    let reply: Inbox[Result[Int, String]] = newInbox()
+    spawnActor(
+        acceptor,
+        AcceptorStart {
+            port: port,
+            shards: pids,
+            logged: persist.dir != "",
+            debug: debug,
+            out: out,
+            reply: reply.pid()
+        }
+    )
+    let answer = match reply.receiveTimeout(5000) {
+        Some(Mail::Msg(r)) => r,
+        _ => Err("the acceptor did not report")
+    }
+    reply.close()
+    let bound = answer?
+    Ok(Running { port: bound, restarts: ups })
+}

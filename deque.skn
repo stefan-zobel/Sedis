@@ -1,0 +1,86 @@
+// A double-ended queue of strings: a ring buffer over a Vec, so a push or pop
+// at either end costs the same, where LPUSH on a plain Vec would move every
+// element.
+
+pub struct Deque {
+    buf: Vec[String],
+    head: Int,
+    count: Int
+}
+
+pub fn newDeque() -> Deque {
+    Deque { buf: fill(8), head: 0, count: 0 }
+}
+
+// A Vec of n empty slots.
+fn fill(n: Int) -> Vec[String] {
+    let mut v: Vec[String] = vec()
+    let mut i = 0
+    while i < n {
+        push(v, "")
+        i += 1
+    }
+    v
+}
+
+impl Deque {
+    fn size(self) -> Int {
+        self.count
+    }
+
+    // The i-th element from the front, 0 <= i < size().
+    fn at(self, i: Int) -> String {
+        self.buf[(self.head + i) % len(self.buf)]
+    }
+
+    fn pushFront(mut self, s: String) -> () {
+        grow(self)
+        let cap = len(self.buf)
+        self.head = (self.head + cap - 1) % cap
+        let mut b = self.buf
+        b[self.head] = s
+        self.count += 1
+    }
+
+    fn pushBack(mut self, s: String) -> () {
+        grow(self)
+        let mut b = self.buf
+        b[(self.head + self.count) % len(self.buf)] = s
+        self.count += 1
+    }
+
+    // Take the first element; the deque must not be empty.
+    fn popFront(mut self) -> String {
+        let mut b = self.buf
+        let s = b[self.head]
+        b[self.head] = ""
+        self.head = (self.head + 1) % len(b)
+        self.count -= 1
+        s
+    }
+
+    // Take the last element; the deque must not be empty.
+    fn popBack(mut self) -> String {
+        let mut b = self.buf
+        let i = (self.head + self.count - 1) % len(b)
+        let s = b[i]
+        b[i] = ""
+        self.count -= 1
+        s
+    }
+}
+
+// Double the buffer when it is full, keeping the order from the front.
+fn grow(mut d: Deque) -> () {
+    if d.count < len(d.buf) {
+        return ()
+    }
+    let mut next = fill(len(d.buf) * 2)
+    let mut i = 0
+    while i < d.count {
+        next[i] = d.at(i)
+        i += 1
+    }
+    d.buf = next
+    d.head = 0
+}

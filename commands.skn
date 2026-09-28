@@ -1,0 +1,941 @@
+// The commands: which ones exist, how many arguments each takes, where it
+// runs, and what it does to a keyspace. A shard actor owns one keyspace and
+// runs the commands its keys route to; the connection actor answers the few
+// that touch no key itself.
+
+import deque
+import glob
+use deque::*
+use glob::*
+use std::resp::*
+
+
+// ---- the keyspace ----
+
+// What a key holds.
+pub enum Val {
+    Str(String),
+    Hash(Map[String, String]),
+    List(Deque)
+}
+
+// One shard's data. `expires` holds the moment (epoch milliseconds) each key
+// with a time to live ends; `expKeys` lists those keys once more, so that the
+// periodic sweep can visit a few of them at a time (a Map cannot be walked
+// from the middle).
+pub struct Keyspace {
+    data: Map[String, Val],
+    expires: Map[String, Int],
+    expKeys: Vec[String],
+    sweep: Int
+}
+
+pub fn newKeyspace() -> Keyspace {
+    Keyspace { data: #{}, expires: #{}, expKeys: vec(), sweep: 0 }
+}
+
+// Remove a key and its time to live.
+fn remove(mut ks: Keyspace, key: String) -> Bool {
+    let _t = delete(ks.expires, key)
+    delete(ks.data, key)
+}
+
+// Give `key` its end at `at`.
+fn setExpiry(mut ks: Keyspace, key: String, at: Int) -> () {
+    if !has(ks.expires, key) {
+        push(ks.expKeys, key)
+    }
+    ks.expires[key] = at
+}
+
+// If `key` has passed its end, remove it now (the lazy half of expiry).
+fn touch(mut ks: Keyspace, key: String, now: Int) -> () {
+    match get(ks.expires, key) {
+        Some(at) => {
+            if at <= now {
+                let _r = remove(ks, key)
+            }
+        },
+        None => {}
+    }
+}
+
+// The active half of expiry: visit up to `n` keys with a time to live, and
+// remove those that have ended. Answers how many were removed. A key that no
+// longer has a time to live leaves the list here.
+pub fn sweepExpired(mut ks: Keyspace, now: Int, n: Int) -> Int {
+    let mut removed = 0
+    let mut seen = 0
+    let mut keys = ks.expKeys
+    while seen < n && len(keys) > 0 {
+        if ks.sweep >= len(keys) {
+            ks.sweep = 0
+        }
+        let key = keys[ks.sweep]
+        let drop = match get(ks.expires, key) {
+            Some(at) => {
+                if at <= now {
+                    let _r = remove(ks, key)
+                    removed += 1
+                    true
+                } else {
+                    false
+                }
+            },
+            None => true
+        }
+        if drop {
+            // swap the last one in; the same position is visited next
+            let last = pop(keys)
+            if ks.sweep < len(keys) {
+                keys[ks.sweep] = unwrap(last)
+            }
+        } else {
+            ks.sweep += 1
+        }
+        seen += 1
+    }
+    removed
+}
+
+// ---- the command table ----
+
+// Where a command runs.
+//   Local      at the connection: PING, ECHO, QUIT, and the stubs clients
+//              ask for (COMMAND, CONFIG, CLIENT, SELECT, INFO)
+//   OneKey     at the shard of its first key (args[1])
+//   DelLike    several keys, each at its shard; the answers are summed
+//              (DEL, EXISTS)
+//   GetLike    several keys, each at its shard; the answers are put back in
+//              order (MGET)
+//   SetLike    key-value pairs, each at the shard of its key; OK when all
+//              are (MSET)
+//   AllSum     every shard; the answers are summed (DBSIZE)
+//   AllOk      every shard; OK when all are (FLUSHDB)
+//   AllConcat  every shard; the arrays are joined (KEYS)
+//   Debug      DEBUG CRASH key: at the shard of the key, which then crashes
+pub enum Route {
+    Local,
+    OneKey,
+    DelLike,
+    GetLike,
+    SetLike,
+    AllSum,
+    AllOk,
+    AllConcat,
+    Debug
+}
+
+// A command's arity counts its name, as in Redis: n means exactly n words,
+// -n at least n.
+pub struct Spec {
+    arity: Int,
+    route: Route
+}
+
+fn spec(arity: Int, route: Route) -> Option[Spec] {
+    Some(Spec { arity: arity, route: route })
+}
+
+// The spec of the command `name` (upper case), or None if there is none.
+pub fn specOf(name: String) -> Option[Spec] {
+    match name {
+        "PING" => spec(-1, Route::Local),
+        "ECHO" => spec(2, Route::Local),
+        "QUIT" => spec(-1, Route::Local),
+        "COMMAND" => spec(-1, Route::Local),
+        "CONFIG" => spec(-2, Route::Local),
+        "CLIENT" => spec(-2, Route::Local),
+        "SELECT" => spec(2, Route::Local),
+        "INFO" => spec(-1, Route::Local),
+        "GET" => spec(2, Route::OneKey),
+        "SET" => spec(-3, Route::OneKey),
+        "INCR" => spec(2, Route::OneKey),
+        "DECR" => spec(2, Route::OneKey),
+        "INCRBY" => spec(3, Route::OneKey),
+        "DECRBY" => spec(3, Route::OneKey),
+        "APPEND" => spec(3, Route::OneKey),
+        "STRLEN" => spec(2, Route::OneKey),
+        "EXPIRE" => spec(-3, Route::OneKey),
+        "PEXPIRE" => spec(-3, Route::OneKey),
+        "EXPIREAT" => spec(-3, Route::OneKey),
+        "PEXPIREAT" => spec(-3, Route::OneKey),
+        "TTL" => spec(2, Route::OneKey),
+        "PTTL" => spec(2, Route::OneKey),
+        "PERSIST" => spec(2, Route::OneKey),
+        "TYPE" => spec(2, Route::OneKey),
+        "HSET" => spec(-4, Route::OneKey),
+        "HGET" => spec(3, Route::OneKey),
+        "HDEL" => spec(-3, Route::OneKey),
+        "HGETALL" => spec(2, Route::OneKey),
+        "HEXISTS" => spec(3, Route::OneKey),
+        "HLEN" => spec(2, Route::OneKey),
+        "HKEYS" => spec(2, Route::OneKey),
+        "HVALS" => spec(2, Route::OneKey),
+        "HINCRBY" => spec(4, Route::OneKey),
+        "LPUSH" => spec(-3, Route::OneKey),
+        "RPUSH" => spec(-3, Route::OneKey),
+        "LPOP" => spec(-2, Route::OneKey),
+        "RPOP" => spec(-2, Route::OneKey),
+        "LRANGE" => spec(4, Route::OneKey),
+        "LLEN" => spec(2, Route::OneKey),
+        "LINDEX" => spec(3, Route::OneKey),
+        "DEL" => spec(-2, Route::DelLike),
+        "EXISTS" => spec(-2, Route::DelLike),
+        "MGET" => spec(-2, Route::GetLike),
+        "MSET" => spec(-3, Route::SetLike),
+        "DBSIZE" => spec(1, Route::AllSum),
+        "FLUSHDB" => spec(-1, Route::AllOk),
+        "FLUSHALL" => spec(-1, Route::AllOk),
+        "KEYS" => spec(2, Route::AllConcat),
+        "BGREWRITEAOF" => spec(1, Route::AllOk),
+        "DEBUG" => spec(3, Route::Debug),
+        "SEDIS.GC" => spec(-1, Route::AllConcat),
+        _ => None
+    }
+}
+
+// Whether `n` words fit the arity; MSET and HSET also need whole pairs.
+pub fn arityOk(name: String, s: Spec, n: Int) -> Bool {
+    let fits = if s.arity >= 0 { n == s.arity } else { n >= 0 - s.arity }
+    if name == "MSET" {
+        fits && n % 2 == 1
+    } else if name == "HSET" {
+        fits && n % 2 == 0
+    } else {
+        fits
+    }
+}
+
+// ---- Redis' error texts, word for word, so clients that match on them
+// keep working ----
+
+pub fn wrongArity(name: String) -> Resp {
+    Resp::Error(
+        "ERR wrong number of arguments for '" + toLower(name) + "' command"
+    )
+}
+
+pub fn unknownCommand(args: Vec[String]) -> Resp {
+    let mut tail = ""
+    let mut i = 1
+    while i < len(args) {
+        tail = tail + "'" + args[i] + "' "
+        i += 1
+    }
+    Resp::Error(
+        "ERR unknown command '"
+            + args[0]
+            + "', with args beginning with: "
+            + tail
+    )
+}
+
+fn notInteger() -> Resp {
+    Resp::Error("ERR value is not an integer or out of range")
+}
+
+fn wrongType() -> Resp {
+    let text = "WRONGTYPE Operation against a key holding the wrong kind"
+    Resp::Error(text + " of value")
+}
+
+fn notHashInteger() -> Resp {
+    Resp::Error("ERR hash value is not an integer")
+}
+
+fn notPositive() -> Resp {
+    Resp::Error("ERR value is out of range, must be positive")
+}
+
+// What INFO answers: the Redis version it behaves like, and its own.
+fn info() -> Resp {
+    let server = "# Server\r\nredis_version:7.2.0\r\n"
+    Resp::Bulk(server + "sedis_version:0.1.0\r\n")
+}
+
+fn syntaxError() -> Resp {
+    Resp::Error("ERR syntax error")
+}
+
+fn badExpire(name: String) -> Resp {
+    Resp::Error("ERR invalid expire time in '" + toLower(name) + "' command")
+}
+
+// The largest magnitude a Skarn Int holds: 2^47 - 1. Redis counts to 2^63 - 1.
+const MAX_INT: Int = 140737488355327
+
+// A whole number as Redis accepts one in a command: an optional '-', no
+// leading zero, no '+', no spaces, and here at most 15 digits within
+// +-MAX_INT.
+pub fn strictInt(s: String) -> Option[Int] {
+    let n = len(s)
+    if n == 0 || n > 16 {
+        return None
+    }
+    let mut i = 0
+    let mut neg = false
+    for c in s {
+        if i == 0 && c == 45 && n > 1 {
+            neg = true
+        } else if c < 48 || c > 57 {
+            return None
+        }
+        i += 1
+    }
+    let digits = if neg { n - 1 } else { n }
+    if digits > 15 {
+        return None
+    }
+    let first = if neg { 1 } else { 0 }
+    if digits > 1 && charAt(s, first) == 48 {
+        return None
+    }
+    if neg && digits == 1 && charAt(s, 1) == 48 {
+        return None
+    }
+    match parseInt(s) {
+        Ok(v) => if v > MAX_INT || v < 0 - MAX_INT { None } else { Some(v) },
+        Err(_) => None
+    }
+}
+
+// ---- the commands a connection answers itself (all but QUIT) ----
+
+// `logged` says whether the shards write an append-only file.
+pub fn localCommand(name: String, args: Vec[String], logged: Bool) -> Resp {
+    match name {
+        "PING" => {
+            if len(args) == 1 {
+                Resp::Simple("PONG")
+            } else if len(args) == 2 {
+                Resp::Bulk(args[1])
+            } else {
+                wrongArity(name)
+            }
+        },
+        "ECHO" => Resp::Bulk(args[1]),
+        // redis-cli asks for the command docs when it starts; no docs is a
+        // valid answer.
+        "COMMAND" => Resp::Arr(vec()),
+        "CONFIG" => config(args, logged),
+        "CLIENT" => {
+            let sub = toUpper(args[1])
+            if sub == "SETNAME" || sub == "SETINFO" {
+                Resp::Simple("OK")
+            } else {
+                Resp::Error(
+                    "ERR unknown subcommand '" + args[1] + "'. Try CLIENT HELP."
+                )
+            }
+        },
+        "SELECT" => {
+            if args[1] == "0" {
+                Resp::Simple("OK")
+            } else {
+                Resp::Error("ERR DB index is out of range")
+            }
+        },
+        "INFO" => info(),
+        _ => unknownCommand(args)
+    }
+}
+
+// CONFIG GET answers name-value pairs; redis-benchmark asks for two.
+fn config(args: Vec[String], logged: Bool) -> Resp {
+    if toUpper(args[1]) != "GET" || len(args) != 3 {
+        return Resp::Error("ERR CONFIG " + args[1] + " is not supported")
+    }
+    let name = toLower(args[2])
+    if name == "save" {
+        Resp::Arr(toVec([Resp::Bulk("save"), Resp::Bulk("")]))
+    } else if name == "appendonly" {
+        let on = if logged { "yes" } else { "no" }
+        Resp::Arr(toVec([Resp::Bulk("appendonly"), Resp::Bulk(on)]))
+    } else {
+        Resp::Arr(vec())
+    }
+}
+
+// ---- running a command on a keyspace ----
+
+// Run `args` (its name upper-cased by the caller, its arity already checked)
+// against `ks`. `now` is the time in epoch milliseconds.
+pub fn execute(
+    mut ks: Keyspace,
+    name: String,
+    args: Vec[String],
+    now: Int
+) -> Resp {
+    touchKeys(ks, name, args, now)
+    match name {
+        "GET" => match get(ks.data, args[1]) {
+            Some(Val::Str(s)) => Resp::Bulk(s),
+            Some(_) => wrongType(),
+            None => Resp::Null
+        },
+        "SET" => set(ks, args, now),
+        "INCR" => incrBy(ks, args[1], 1),
+        "DECR" => incrBy(ks, args[1], -1),
+        "INCRBY" => match strictInt(args[2]) {
+            Some(d) => incrBy(ks, args[1], d),
+            None => notInteger()
+        },
+        "DECRBY" => match strictInt(args[2]) {
+            Some(d) => incrBy(ks, args[1], 0 - d),
+            None => notInteger()
+        },
+        "APPEND" => {
+            let joined = match get(ks.data, args[1]) {
+                Some(Val::Str(s)) => s + args[2],
+                Some(_) => return wrongType(),
+                None => args[2]
+            }
+            ks.data[args[1]] = Val::Str(joined)
+            Resp::Integer(len(joined))
+        },
+        "STRLEN" => match get(ks.data, args[1]) {
+            Some(Val::Str(s)) => Resp::Integer(len(s)),
+            Some(_) => wrongType(),
+            None => Resp::Integer(0)
+        },
+        "DEL" => {
+            let mut n = 0
+            let mut i = 1
+            while i < len(args) {
+                if remove(ks, args[i]) {
+                    n += 1
+                }
+                i += 1
+            }
+            Resp::Integer(n)
+        },
+        "EXISTS" => {
+            let mut n = 0
+            let mut i = 1
+            while i < len(args) {
+                if has(ks.data, args[i]) {
+                    n += 1
+                }
+                i += 1
+            }
+            Resp::Integer(n)
+        },
+        "MGET" => {
+            let mut out: Vec[Resp] = vec()
+            let mut i = 1
+            while i < len(args) {
+                let v = match get(ks.data, args[i]) {
+                    Some(Val::Str(s)) => Resp::Bulk(s),
+                    _ => Resp::Null
+                }
+                push(out, v)
+                i += 1
+            }
+            Resp::Arr(out)
+        },
+        "MSET" => {
+            let mut i = 1
+            while i + 1 < len(args) {
+                let _t = delete(ks.expires, args[i])
+                ks.data[args[i]] = Val::Str(args[i + 1])
+                i += 2
+            }
+            Resp::Simple("OK")
+        },
+        "DBSIZE" => Resp::Integer(len(ks.data)),
+        "FLUSHDB" => flush(ks),
+        "FLUSHALL" => flush(ks),
+        "KEYS" => {
+            let mut out: Vec[Resp] = vec()
+            for (k, _) in ks.data {
+                let live = match get(ks.expires, k) {
+                    Some(at) => at > now,
+                    None => true
+                }
+                if live && globMatch(args[1], k) {
+                    push(out, Resp::Bulk(k))
+                }
+            }
+            Resp::Arr(out)
+        },
+        "EXPIRE" => expire(ks, args, now, 1000, false),
+        "PEXPIRE" => expire(ks, args, now, 1, false),
+        "EXPIREAT" => expire(ks, args, now, 1000, true),
+        "PEXPIREAT" => expire(ks, args, now, 1, true),
+        "TTL" => ttl(ks, args[1], now, 1000),
+        "PTTL" => ttl(ks, args[1], now, 1),
+        "PERSIST" => {
+            if has(ks.data, args[1]) && delete(ks.expires, args[1]) {
+                Resp::Integer(1)
+            } else {
+                Resp::Integer(0)
+            }
+        },
+        "TYPE" => match get(ks.data, args[1]) {
+            Some(Val::Str(_)) => Resp::Simple("string"),
+            Some(Val::Hash(_)) => Resp::Simple("hash"),
+            Some(Val::List(_)) => Resp::Simple("list"),
+            None => Resp::Simple("none")
+        },
+        _ => {
+            if startsWith(name, "H") {
+                hashCommand(ks, name, args)
+            } else {
+                listCommand(ks, name, args)
+            }
+        }
+    }
+}
+
+// Remove the keys of this command that have passed their end, before the
+// command sees them.
+fn touchKeys(
+    mut ks: Keyspace,
+    name: String,
+    args: Vec[String],
+    now: Int
+) -> () {
+    if len(ks.expires) == 0 || len(args) < 2 {
+        return ()
+    }
+    if name == "DEL" || name == "EXISTS" || name == "MGET" {
+        let mut i = 1
+        while i < len(args) {
+            touch(ks, args[i], now)
+            i += 1
+        }
+    } else if name == "MSET" {
+        let mut i = 1
+        while i < len(args) {
+            touch(ks, args[i], now)
+            i += 2
+        }
+    } else if name != "KEYS" {
+        touch(ks, args[1], now)
+    }
+}
+
+fn flush(mut ks: Keyspace) -> Resp {
+    ks.data = #{}
+    ks.expires = #{}
+    ks.expKeys = vec()
+    ks.sweep = 0
+    Resp::Simple("OK")
+}
+
+// SET key value [EX s | PX ms | EXAT s | PXAT ms | KEEPTTL] [NX | XX] [GET]
+fn set(mut ks: Keyspace, args: Vec[String], now: Int) -> Resp {
+    let key = args[1]
+    let mut at = -1
+    let mut keepTtl = false
+    let mut nx = false
+    let mut xx = false
+    let mut wantOld = false
+    let mut timed = false
+    let mut i = 3
+    while i < len(args) {
+        let opt = toUpper(args[i])
+        let timeOpt = opt == "EX"
+            || opt == "PX"
+            || opt == "EXAT"
+            || opt == "PXAT"
+        if opt == "NX" && !xx {
+            nx = true
+        } else if opt == "XX" && !nx {
+            xx = true
+        } else if opt == "GET" {
+            wantOld = true
+        } else if opt == "KEEPTTL" && !timed {
+            keepTtl = true
+        } else if timeOpt && !timed && !keepTtl && i + 1 < len(args) {
+            timed = true
+            let n = match strictInt(args[i + 1]) {
+                Some(v) => v,
+                None => return notInteger()
+            }
+            let unit = if opt == "EX" || opt == "EXAT" { 1000 } else { 1 }
+            let relative = opt == "EX" || opt == "PX"
+            if n <= 0 || !timeFits(n, unit, relative, now) {
+                return badExpire("set")
+            }
+            at = if opt == "EX" {
+                now + n * 1000
+            } else if opt == "PX" {
+                now + n
+            } else if opt == "EXAT" {
+                n * 1000
+            } else {
+                n
+            }
+            i += 1
+        } else {
+            return syntaxError()
+        }
+        i += 1
+    }
+    let old = match get(ks.data, key) {
+        Some(Val::Str(s)) => Resp::Bulk(s),
+        Some(_) => {
+            if wantOld {
+                return wrongType()
+            }
+            Resp::Null
+        },
+        None => Resp::Null
+    }
+    let exists = has(ks.data, key)
+    if (nx && exists) || (xx && !exists) {
+        return if wantOld { old } else { Resp::Null }
+    }
+    ks.data[key] = Val::Str(args[2])
+    if at >= 0 {
+        setExpiry(ks, key, at)
+    } else if !keepTtl {
+        let _t = delete(ks.expires, key)
+    }
+    if wantOld {
+        old
+    } else {
+        Resp::Simple("OK")
+    }
+}
+
+fn incrBy(mut ks: Keyspace, key: String, d: Int) -> Resp {
+    let old = match get(ks.data, key) {
+        Some(Val::Str(s)) => match strictInt(s) {
+            Some(v) => v,
+            None => return notInteger()
+        },
+        Some(_) => return wrongType(),
+        None => 0
+    }
+    if overflows(old, d) {
+        return Resp::Error("ERR increment or decrement would overflow")
+    }
+    let n = old + d
+    ks.data[key] = Val::Str(toString(n))
+    Resp::Integer(n)
+}
+
+// Whether old + d leaves +-MAX_INT.
+fn overflows(old: Int, d: Int) -> Bool {
+    (d > 0 && old > MAX_INT - d) || (d < 0 && old < 0 - MAX_INT - d)
+}
+
+// Whether n (in units of `unit` milliseconds, from now if `relative`) is a
+// moment a Skarn Int can hold: the result must stay within +-MAX_INT.
+fn timeFits(n: Int, unit: Int, relative: Bool, now: Int) -> Bool {
+    let room = if relative { MAX_INT - now } else { MAX_INT }
+    n <= room / unit && n >= 0 - room / unit
+}
+
+// EXPIRE key n [NX | XX | GT | LT], and its millisecond and absolute forms.
+// `unit` is 1000 for seconds, 1 for milliseconds.
+fn expire(
+    mut ks: Keyspace,
+    args: Vec[String],
+    now: Int,
+    unit: Int,
+    absolute: Bool
+) -> Resp {
+    let name = args[0]
+    let n = match strictInt(args[2]) {
+        Some(v) => v,
+        None => return notInteger()
+    }
+    if !timeFits(n, unit, !absolute, now) {
+        return badExpire(name)
+    }
+    let mut cond = ""
+    if len(args) == 4 {
+        cond = toUpper(args[3])
+        if cond != "NX" && cond != "XX" && cond != "GT" && cond != "LT" {
+            return Resp::Error("ERR Unsupported option " + args[3])
+        }
+    } else if len(args) > 4 {
+        return syntaxError()
+    }
+    let key = args[1]
+    if !has(ks.data, key) {
+        return Resp::Integer(0)
+    }
+    let at = if absolute { n * unit } else { now + n * unit }
+    let allowed = match get(ks.expires, key) {
+        Some(c) => {
+            if cond == "NX" {
+                false
+            } else if cond == "GT" {
+                at > c
+            } else if cond == "LT" {
+                at < c
+            } else {
+                true
+            }
+        },
+        // no time to live counts as an infinite one
+        None => cond == "" || cond == "NX" || cond == "LT"
+    }
+    if !allowed {
+        return Resp::Integer(0)
+    }
+    if at <= now {
+        let _r = remove(ks, key)
+    } else {
+        setExpiry(ks, key, at)
+    }
+    Resp::Integer(1)
+}
+
+// TTL and PTTL: -2 for a missing key, -1 for one with no end.
+fn ttl(ks: Keyspace, key: String, now: Int, unit: Int) -> Resp {
+    if !has(ks.data, key) {
+        return Resp::Integer(-2)
+    }
+    match get(ks.expires, key) {
+        Some(at) => {
+            let left = at - now
+            Resp::Integer(if unit == 1 { left } else { (left + 500) / 1000 })
+        },
+        None => Resp::Integer(-1)
+    }
+}
+
+// ---- hashes ----
+
+// The hash at `key`, made empty and stored if there is none.
+fn hashFor(
+    mut ks: Keyspace,
+    key: String,
+    found: Option[Map[String, String]]
+) -> Map[String, String] {
+    match found {
+        Some(h) => h,
+        None => {
+            let fresh: Map[String, String] = #{}
+            ks.data[key] = Val::Hash(fresh)
+            fresh
+        }
+    }
+}
+
+fn hashCommand(mut ks: Keyspace, name: String, args: Vec[String]) -> Resp {
+    let key = args[1]
+    let found = match get(ks.data, key) {
+        Some(Val::Hash(h)) => Some(h),
+        Some(_) => return wrongType(),
+        None => None
+    }
+    if name == "HSET" {
+        let mut h = hashFor(ks, key, found)
+        let mut added = 0
+        let mut i = 2
+        while i + 1 < len(args) {
+            if !has(h, args[i]) {
+                added += 1
+            }
+            h[args[i]] = args[i + 1]
+            i += 2
+        }
+        return Resp::Integer(added)
+    }
+    if name == "HINCRBY" {
+        let d = match strictInt(args[3]) {
+            Some(v) => v,
+            None => return notInteger()
+        }
+        let old = match found {
+            Some(h) => match get(h, args[2]) {
+                Some(s) => match strictInt(s) {
+                    Some(v) => v,
+                    None => return notHashInteger()
+                },
+                None => 0
+            },
+            None => 0
+        }
+        if overflows(old, d) {
+            return Resp::Error("ERR increment or decrement would overflow")
+        }
+        let mut h = hashFor(ks, key, found)
+        h[args[2]] = toString(old + d)
+        return Resp::Integer(old + d)
+    }
+    match found {
+        Some(h) => hashRead(ks, name, args, h),
+        None => emptyHashAnswer(name)
+    }
+}
+
+// What a hash command answers for a key that does not exist.
+fn emptyHashAnswer(name: String) -> Resp {
+    if name == "HGET" {
+        Resp::Null
+    } else if name == "HGETALL" || name == "HKEYS" || name == "HVALS" {
+        Resp::Arr(vec())
+    } else {
+        Resp::Integer(0)
+    }
+}
+
+fn hashRead(
+    mut ks: Keyspace,
+    name: String,
+    args: Vec[String],
+    h: Map[String, String]
+) -> Resp {
+    match name {
+        "HGET" => match get(h, args[2]) {
+            Some(v) => Resp::Bulk(v),
+            None => Resp::Null
+        },
+        "HEXISTS" => Resp::Integer(if has(h, args[2]) { 1 } else { 0 }),
+        "HLEN" => Resp::Integer(len(h)),
+        "HDEL" => {
+            let mut hh = h
+            let mut n = 0
+            let mut i = 2
+            while i < len(args) {
+                if delete(hh, args[i]) {
+                    n += 1
+                }
+                i += 1
+            }
+            if len(hh) == 0 {
+                let _r = remove(ks, args[1])
+            }
+            Resp::Integer(n)
+        },
+        _ => {
+            let mut out: Vec[Resp] = vec()
+            for (f, v) in h {
+                if name != "HVALS" {
+                    push(out, Resp::Bulk(f))
+                }
+                if name != "HKEYS" {
+                    push(out, Resp::Bulk(v))
+                }
+            }
+            Resp::Arr(out)
+        }
+    }
+}
+
+// ---- lists ----
+
+// What a list command answers for a key that does not exist.
+fn emptyListAnswer(name: String, args: Vec[String]) -> Resp {
+    if name == "LRANGE" {
+        Resp::Arr(vec())
+    } else if name == "LLEN" {
+        Resp::Integer(0)
+    } else if (name == "LPOP" || name == "RPOP") && len(args) == 3 {
+        Resp::NullArray
+    } else {
+        Resp::Null
+    }
+}
+
+fn listCommand(mut ks: Keyspace, name: String, args: Vec[String]) -> Resp {
+    let key = args[1]
+    let found = match get(ks.data, key) {
+        Some(Val::List(d)) => Some(d),
+        Some(_) => return wrongType(),
+        None => None
+    }
+    if name == "LPUSH" || name == "RPUSH" {
+        let mut d = match found {
+            Some(d) => d,
+            None => {
+                let fresh = newDeque()
+                ks.data[key] = Val::List(fresh)
+                fresh
+            }
+        }
+        let mut i = 2
+        while i < len(args) {
+            if name == "LPUSH" {
+                d.pushFront(args[i])
+            } else {
+                d.pushBack(args[i])
+            }
+            i += 1
+        }
+        return Resp::Integer(d.size())
+    }
+    let mut d = match found {
+        Some(d) => d,
+        None => return emptyListAnswer(name, args)
+    }
+    match name {
+        "LLEN" => Resp::Integer(d.size()),
+        "LINDEX" => match strictInt(args[2]) {
+            Some(i) => {
+                let j = if i < 0 { d.size() + i } else { i }
+                if j < 0 || j >= d.size() {
+                    Resp::Null
+                } else {
+                    Resp::Bulk(d.at(j))
+                }
+            },
+            None => notInteger()
+        },
+        "LRANGE" => lrange(d, args),
+        _ => {
+            // LPOP / RPOP key [count]
+            let counted = len(args) == 3
+            let count = if counted {
+                match strictInt(args[2]) {
+                    Some(c) => c,
+                    None => return notInteger()
+                }
+            } else { 1 }
+            if count < 0 {
+                return notPositive()
+            }
+            let mut out: Vec[Resp] = vec()
+            let mut i = 0
+            while i < count && d.size() > 0 {
+                let s = if name == "LPOP" { d.popFront() } else { d.popBack() }
+                push(out, Resp::Bulk(s))
+                i += 1
+            }
+            if d.size() == 0 {
+                let _r = remove(ks, key)
+            }
+            if counted {
+                Resp::Arr(out)
+            } else {
+                out[0]
+            }
+        }
+    }
+}
+
+// LRANGE key start stop, both inclusive, negative ones counted from the end.
+fn lrange(d: Deque, args: Vec[String]) -> Resp {
+    let n = d.size()
+    let a = match strictInt(args[2]) {
+        Some(v) => v,
+        None => return notInteger()
+    }
+    let b = match strictInt(args[3]) {
+        Some(v) => v,
+        None => return notInteger()
+    }
+    let mut lo = if a < 0 { n + a } else { a }
+    let mut hi = if b < 0 { n + b } else { b }
+    if lo < 0 {
+        lo = 0
+    }
+    if hi >= n {
+        hi = n - 1
+    }
+    let mut out: Vec[Resp] = vec()
+    let mut i = lo
+    while i <= hi {
+        push(out, Resp::Bulk(d.at(i)))
+        i += 1
+    }
+    Resp::Arr(out)
+}

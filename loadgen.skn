@@ -1,0 +1,342 @@
+// A load generator for any server that speaks RESP -- Sedis, the Python
+// server under python/, or Redis itself. C clients at once, each a task
+// (std::task) with one connection, send a command P at a time (pipelining)
+// for S seconds. Every answer is checked, and every round trip is timed.
+//
+// Run:   skarnvm loadgen.skn --port=P [--command=set] [--clients=C]
+//            [--pipeline=N] [--seconds=S] [--keys=K] [--size=B]
+//   --command=X  set, get, incr, lpush, hset, mset (10 keys) or ping; or
+//                fill, which writes every key once (MSET, 10 keys each) and
+//                stops -- to load the keyspace before a measurement
+//   --clients=C  connections at the same time (default 16)
+//   --pipeline=N commands sent before the first answer is read (default 1)
+//   --seconds=S  how long each client runs (default 2)
+//   --keys=K     keys are key:0 .. key:K-1, chosen at random (default 10000)
+//   --size=B     bytes per value (default 3, as redis-benchmark)
+//
+// Prints one line: ops, errors, seconds, ops per second, and the round-trip
+// latency of a pipeline at the 50th and 99th percentile and at most, in
+// microseconds. The requests are encoded before the clock starts, so the
+// client spends its time on sending, receiving and checking.
+
+use std::cli::*
+use std::env::*
+use std::net::*
+use std::process::exit
+use std::random::*
+use std::resp::*
+use std::task::*
+
+
+// Latencies are counted per microsecond up to this, and above it in one
+// bucket (whose values are still reported through `maxNs`).
+const BUCKETS: Int = 10000
+
+struct Job {
+    port: Int,
+    clients: Int,
+    command: String,
+    pipeline: Int,
+    seconds: Int,
+    keys: Int,
+    size: Int,
+    seed: Int
+}
+
+struct Outcome {
+    ops: Int,
+    errors: Int,
+    firstError: String,
+    hist: Vec[Int],
+    maxNs: Int
+}
+
+// The words of one command, with a random key.
+fn words(job: Job, mut r: Rng, value: String) -> Vec[String] {
+    let key = "key:${r.nextInt(0, job.keys - 1)}"
+    match job.command {
+        "set" => toVec(["SET", key, value]),
+        "get" => toVec(["GET", key]),
+        "incr" => toVec(["INCR", "counter:${r.nextInt(0, job.keys - 1)}"]),
+        "lpush" => toVec(["LPUSH", "list:${r.nextInt(0, 99)}", value]),
+        "hset" => toVec(["HSET", "hash:${r.nextInt(0, 99)}", key, value]),
+        "mset" => {
+            let mut w: Vec[String] = toVec(["MSET"])
+            let mut i = 0
+            while i < 10 {
+                push(w, "key:${r.nextInt(0, job.keys - 1)}")
+                push(w, value)
+                i += 1
+            }
+            w
+        },
+        _ => toVec(["PING"])
+    }
+}
+
+// Whether an answer is the one the command must get.
+fn answerOk(command: String, r: Resp) -> Bool {
+    match r {
+        Resp::Error(_) => false,
+        Resp::Simple(s) => {
+            (command == "set" || command == "mset") && s == "OK"
+                || command == "ping" && s == "PONG"
+        },
+        Resp::Integer(_) => {
+            command == "incr" || command == "lpush" || command == "hset"
+        },
+        Resp::Bulk(_) => command == "get",
+        Resp::Null => command == "get",
+        _ => false
+    }
+}
+
+// No ops yet, and an empty histogram.
+fn newOutcome() -> Outcome {
+    let mut hist: Vec[Int] = vec()
+    let mut b = 0
+    while b <= BUCKETS {
+        push(hist, 0)
+        b += 1
+    }
+    Outcome { ops: 0, errors: 0, firstError: "", hist: hist, maxNs: 0 }
+}
+
+fn fail(mut o: Outcome, why: String) -> Outcome {
+    o.errors += 1
+    if o.firstError == "" {
+        o.firstError = why
+    }
+    o
+}
+
+// fill: this client writes the keys c, c + C, c + 2C, ... (c its number,
+// C the number of clients), MSET with 10 keys, `pipeline` MSETs at a time.
+fn filler(job: Job) -> Outcome {
+    let mut o = newOutcome()
+    let conn = match connect("127.0.0.1", job.port) {
+        Ok(c) => c,
+        Err(e) => return fail(o, e)
+    }
+    let value = repeatStr("x", job.size)
+    let mut reader = RespReader::new()
+    let mut k = job.seed - 1
+    while k < job.keys {
+        let mut out = bytes()
+        let mut sent = 0
+        while sent < job.pipeline && k < job.keys {
+            let mut w: Vec[String] = toVec(["MSET"])
+            let mut i = 0
+            while i < 10 && k < job.keys {
+                push(w, "key:${k}")
+                push(w, value)
+                k += job.clients
+                i += 1
+            }
+            appendBytes(out, encodeCommand(w))
+            sent += 1
+        }
+        match conn.send(out) {
+            Ok(_) => {},
+            Err(e) => return fail(o, e)
+        }
+        let mut got = 0
+        while got < sent {
+            match reader.next() {
+                Ok(Some(ans)) => {
+                    if !answerOk("mset", ans) {
+                        o = fail(o, ans.render())
+                    }
+                    got += 1
+                },
+                Ok(None) => {
+                    let chunk = match conn.recv(65536) {
+                        Ok(c) => c,
+                        Err(e) => return fail(o, e)
+                    }
+                    if len(chunk) == 0 {
+                        return fail(o, "the server closed the connection")
+                    }
+                    reader.feed(chunk)
+                },
+                Err(e) => return fail(o, e)
+            }
+        }
+        o.ops += sent
+    }
+    let _c = conn.close()
+    o
+}
+
+// One client: `seconds` seconds of pipelines.
+fn client(job: Job) -> Outcome {
+    if job.command == "fill" {
+        return filler(job)
+    }
+    let mut o = newOutcome()
+    let conn = match connect("127.0.0.1", job.port) {
+        Ok(c) => c,
+        Err(e) => return fail(o, e)
+    }
+    // 64 different pipelines, encoded ahead, used in turn
+    let mut r = Rng::fromSeed(job.seed)
+    let value = repeatStr("x", job.size)
+    let mut batches: Vec[Bytes] = vec()
+    let mut k = 0
+    while k < 64 {
+        let mut out = bytes()
+        let mut i = 0
+        while i < job.pipeline {
+            appendBytes(out, encodeCommand(words(job, r, value)))
+            i += 1
+        }
+        push(batches, out)
+        k += 1
+    }
+    let mut reader = RespReader::new()
+    let deadline = nanoTime() + job.seconds * 1000000000
+    let mut turn = 0
+    let mut going = true
+    while going {
+        let t0 = nanoTime()
+        match conn.send(batches[turn % 64]) {
+            Ok(_) => {},
+            Err(e) => return fail(o, e)
+        }
+        let mut got = 0
+        while got < job.pipeline {
+            match reader.next() {
+                Ok(Some(ans)) => {
+                    if !answerOk(job.command, ans) {
+                        o = fail(o, ans.render())
+                    }
+                    got += 1
+                },
+                Ok(None) => {
+                    let chunk = match conn.recv(65536) {
+                        Ok(c) => c,
+                        Err(e) => return fail(o, e)
+                    }
+                    if len(chunk) == 0 {
+                        return fail(o, "the server closed the connection")
+                    }
+                    reader.feed(chunk)
+                },
+                Err(e) => return fail(o, e)
+            }
+        }
+        let t1 = nanoTime()
+        let dt = t1 - t0
+        let us = dt / 1000
+        let mut h = o.hist
+        h[if us < BUCKETS { us } else { BUCKETS }] += 1
+        if dt > o.maxNs {
+            o.maxNs = dt
+        }
+        o.ops += job.pipeline
+        turn += 1
+        going = t1 < deadline
+    }
+    let _c = conn.close()
+    o
+}
+
+fn intOpt(opts: CliArgs, name: String, dflt: Int) -> Int {
+    match parseInt(opts.getOptOr(name, toString(dflt))) {
+        Ok(v) => v,
+        Err(_) => {
+            eprintln("--${name} needs a whole number")
+            exit(1)
+        }
+    }
+}
+
+// The p-th percentile (0..100) of the counts in `hist`, in microseconds.
+fn pct(hist: Vec[Int], total: Int, p: Int) -> Int {
+    let want = (total * p + 99) / 100
+    let mut seen = 0
+    let mut i = 0
+    while i < len(hist) {
+        seen += hist[i]
+        if seen >= want && want > 0 {
+            return i
+        }
+        i += 1
+    }
+    len(hist) - 1
+}
+
+let opts = CliArgs::parse(args())
+let port = intOpt(opts, "port", 0)
+if port == 0 {
+    eprintln("--port is required")
+    exit(1)
+}
+let clients = intOpt(opts, "clients", 16)
+let command = opts.getOptOr("command", "set")
+let base = Job {
+    port: port,
+    clients: clients,
+    command: command,
+    pipeline: intOpt(opts, "pipeline", 1),
+    seconds: intOpt(opts, "seconds", 2),
+    keys: intOpt(opts, "keys", 10000),
+    size: intOpt(opts, "size", 3),
+    seed: 0
+}
+let t0 = nanoTime()
+let mut tasks: Vec[Task[Outcome]] = vec()
+let mut c = 0
+while c < clients {
+    push(tasks, spawn(client, Job { seed: c + 1, ..base }))
+    c += 1
+}
+let mut hist: Vec[Int] = vec()
+let mut b = 0
+while b <= BUCKETS {
+    push(hist, 0)
+    b += 1
+}
+let mut ops = 0
+let mut errors = 0
+let mut firstError = ""
+let mut maxNs = 0
+let mut rounds = 0
+for t in tasks {
+    match t.join() {
+        Ok(o) => {
+            ops += o.ops
+            errors += o.errors
+            if firstError == "" {
+                firstError = o.firstError
+            }
+            if o.maxNs > maxNs {
+                maxNs = o.maxNs
+            }
+            let mut i = 0
+            while i <= BUCKETS {
+                hist[i] += o.hist[i]
+                rounds += o.hist[i]
+                i += 1
+            }
+        },
+        Err(e) => {
+            errors += 1
+            if firstError == "" {
+                firstError = e
+            }
+        }
+    }
+}
+let wallNs = nanoTime() - t0
+// ops * 10^9 would leave the 48 bits of an Int at a few hundred thousand ops
+let rate = if wallNs >= 1000 { ops * 1000000 / (wallNs / 1000) } else { 0 }
+println(
+    "command ${command} clients ${clients} pipeline ${base.pipeline} ops ${ops}"
+        + " errors ${errors} ms ${wallNs / 1000000} ops/s ${rate}"
+        + " p50us ${pct(hist, rounds, 50)} p99us ${pct(hist, rounds, 99)}"
+        + " maxus ${maxNs / 1000}"
+)
+if errors > 0 {
+    println("first error: ${firstError}")
+}

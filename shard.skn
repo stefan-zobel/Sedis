@@ -1,0 +1,267 @@
+// A shard: an actor that owns one part of the keyspace and runs the commands
+// whose keys hash to it. Every shard has a heap of its own, so a garbage
+// collection stops only the shard that needs it.
+//
+// A connection hands a shard all the work it has for it from one read of the
+// socket at once, as a Batch, and gets the answers back as one message too:
+// with pipelining that is one message each way instead of one per command.
+
+import aof
+import commands
+use aof::*
+use commands::*
+use std::actor::*
+use std::env::*
+use std::resp::*
+
+
+// One piece of work: the words of a command (or of the part of a multi-key
+// command that falls to this shard), and where the connection files the answer
+// -- its sequence number and part.
+pub struct Part {
+    seq: Int,
+    part: Int,
+    name: String,
+    args: Vec[String]
+}
+
+// The answer to one Part.
+pub struct Done {
+    seq: Int,
+    part: Int,
+    value: Resp
+}
+
+// A batch: where to answer, its number (per connection and shard), and the
+// parts. The answer carries the shard's index and the batch's number, which is
+// how a connection finds out that earlier batches were lost in a crash.
+pub enum ShardMsg {
+    Batch(Pid[Answer], Int, Vec[Part])
+}
+
+pub struct Answer {
+    shard: Int,
+    id: Int,
+    done: Vec[Done]
+}
+
+// The shard a key belongs to: FNV-1a over its bytes, modulo the number of
+// shards.
+pub fn shardOf(key: String, shards: Int) -> Int {
+    if shards == 1 {
+        return 0
+    }
+    let mut h = 2166136261
+    for c in key {
+        h = ((h ^ c) * 16777619) & 4294967295
+    }
+    h % shards
+}
+
+// How often a shard looks for keys past their end, in milliseconds, and how
+// many it visits each time. Like Redis, it goes on while a quarter or more of
+// those it visited had ended.
+const SWEEP_EVERY: Int = 100
+
+const SWEEP_KEYS: Int = 20
+
+// Where and how the shards keep their data. `dir` empty: in memory only.
+pub struct Persistence {
+    dir: String,
+    fsync: Fsync,
+    rewriteMin: Int
+}
+
+// What a shard starts with. It reports on `ready` once its data is loaded --
+// at the first start and after every restart: Ok with a line to print (empty
+// if there is nothing to say), or Err.
+pub struct ShardStart {
+    index: Int,
+    persist: Persistence,
+    ready: Pid[Result[ShardUp, String]]
+}
+
+pub struct ShardUp {
+    index: Int,
+    note: String
+}
+
+// Load the shard's log, if it has one, and open it for appending.
+fn load(mut ks: Keyspace, start: ShardStart, now: Int) -> Result[
+    (Option[Aof], String),
+    String
+] {
+    let p = start.persist
+    if p.dir == "" {
+        return Ok((None, ""))
+    }
+    let path = aofPath(p.dir, start.index)
+    let r = replay(ks, path, now)?
+    let mut aof = openAof(path, p.fsync, p.rewriteMin, now)?
+    let mut note = "shard "
+        + toString(start.index)
+        + ": "
+        + toString(r.commands)
+        + " commands replayed, "
+        + toString(len(ks.data))
+        + " keys"
+    if r.tail > 0 {
+        // The process ended while writing the last command. Keep what is whole,
+        // and rewrite the file so the broken end is gone.
+        aof.rewrite(ks)?
+        note = note
+            + "; dropped "
+            + toString(r.tail)
+            + " bytes of an incomplete last command"
+    }
+    Ok((Some(aof), note))
+}
+
+pub fn shardMain(inbox: Inbox[ShardMsg], start: ShardStart) -> () {
+    let mut ks = newKeyspace()
+    let mut log: Option[Aof] = None
+    match load(ks, start, millisTime()) {
+        Ok((a, note)) => {
+            log = a
+            send(start.ready, Ok(ShardUp { index: start.index, note: note }))
+        },
+        Err(e) => {
+            // A crash, not a quiet end: the supervisor counts it, and gives up
+            // if the data cannot be loaded at all.
+            send(start.ready, Err(e))
+            panic("shard " + toString(start.index) + ": " + e)
+        }
+    }
+    let mut lastSweep = millisTime()
+    let mut running = true
+    while running {
+        match inbox.receiveTimeout(SWEEP_EVERY) {
+            Some(Mail::Msg(ShardMsg::Batch(reply, id, parts))) => {
+                // one clock reading per batch: its commands see the same now
+                let now = millisTime()
+                let mut done: Vec[Done] = vec()
+                let mut changes = bytes()
+                for p in parts {
+                    if p.name == "DEBUG" {
+                        panic(
+                            "shard "
+                                + toString(start.index)
+                                + ": DEBUG CRASH, as asked"
+                        )
+                    }
+                    let value = if p.name == "BGREWRITEAOF" {
+                        rewriteNow(log, ks)
+                    } else if p.name == "SEDIS.GC" {
+                        gcReport(start.index, p.args)
+                    } else {
+                        execute(ks, p.name, p.args, now)
+                    }
+                    if isSome(log) {
+                        let _logged = entryFor(changes, ks, p.name, p.args, value)
+                    }
+                    push(done, Done { seq: p.seq, part: p.part, value: value })
+                }
+                // With `always`, the changes are on the disk before anyone
+                // hears that they were made.
+                persist(log, ks, changes, now, start.index)
+                send(reply, Answer { shard: start.index, id: id, done: done })
+            },
+            Some(Mail::Stop) => { running = false },
+            _ => {}
+        }
+        let now = millisTime()
+        if now - lastSweep >= SWEEP_EVERY {
+            lastSweep = now
+            let mut rounds = 0
+            while sweepExpired(ks, now, SWEEP_KEYS) * 4 >= SWEEP_KEYS
+                && rounds < 16 {
+                rounds += 1
+            }
+            match log {
+                Some(a) => {
+                    let mut aa = a
+                    match aa.tick(now) {
+                        Ok(_) => {},
+                        Err(e) => panic(
+                            "shard " + toString(start.index) + ": " + e
+                        )
+                    }
+                },
+                None => {}
+            }
+        }
+    }
+    match log {
+        Some(a) => a.close(),
+        None => {}
+    }
+}
+
+// Write a batch's changes to the log, and rewrite the log when it has grown
+// enough. A log that cannot be written ends the shard: answering "OK" for a
+// change that is not kept would be a lie.
+fn persist(
+    log: Option[Aof],
+    ks: Keyspace,
+    changes: Bytes,
+    now: Int,
+    index: Int
+) -> () {
+    match log {
+        Some(a) => {
+            let mut aa = a
+            let written = match aa.append(changes, now) {
+                Ok(_) => if aa.wantsRewrite() {
+                    aa.rewrite(ks)
+                } else {
+                    Ok(())
+                },
+                Err(e) => Err(e)
+            }
+            match written {
+                Ok(_) => {},
+                Err(e) => panic("shard " + toString(index) + ": " + e)
+            }
+        },
+        None => {}
+    }
+}
+
+pub fn noLog() -> Resp {
+    Resp::Error("ERR there is no append-only file (start sedis with --dir)")
+}
+
+// SEDIS.GC [RESET]: this shard's garbage collector -- every shard has a heap
+// of its own -- as one line: collections, the longest pause, the time spent
+// in all of them, and the mean of what survived a collection. RESET starts
+// the counts again.
+fn gcReport(index: Int, args: Vec[String]) -> Resp {
+    let g = gcStats()
+    let n = toInt(g.collections)
+    let live = if n > 0 { toInt(g.survivorsSum) / n / 1048576 } else { 0 }
+    let line = "shard ${index}: collections=${n}"
+        + " maxPauseUs=${toInt(g.gcNanosMax) / 1000}"
+        + " totalMs=${toInt(g.gcNanosTotal) / 1000000}"
+        + " meanLiveMB=${live}"
+    if len(args) > 1 && toUpper(args[1]) == "RESET" {
+        gcResetStats()
+    }
+    Resp::Arr(toVec([Resp::Bulk(line)]))
+}
+
+// BGREWRITEAOF on this shard. Redis rewrites in the background; a shard does
+// it at once, and serves nothing else meanwhile.
+fn rewriteNow(log: Option[Aof], ks: Keyspace) -> Resp {
+    match log {
+        Some(a) => {
+            let mut aa = a
+            match aa.rewrite(ks) {
+                Ok(_) => Resp::Simple("OK"),
+                Err(e) => Resp::Error(
+                    "ERR rewriting the append-only file: " + e
+                )
+            }
+        },
+        None => noLog()
+    }
+}
