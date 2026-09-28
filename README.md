@@ -1,4 +1,4 @@
-# Sedis
+# Sedis - a Redis clone written in Skarn
 
 [![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![written in Skarn](https://img.shields.io/badge/written%20in-Skarn-0b7d74.svg)](https://github.com/stefan-zobel/Skarn)
